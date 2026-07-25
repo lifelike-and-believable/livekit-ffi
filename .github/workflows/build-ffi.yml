@@ -97,15 +97,15 @@ jobs:
           cd livekit_ffi
           cargo build --release --features with_livekit
 
-      # Guards against ffmpeg (LGPL) and OpenH264 re-entering the shipped DLL.
-      # Report-only until the H.264-free libwebrtc lands -- the current prebuilt
-      # libwebrtc is built with rtc_use_h264=true, so this reports hits today by
-      # design. Flip to a hard failure once a clean build is in use.
+      # Hard gate: ffmpeg (LGPL) and OpenH264 must not re-enter the shipped DLL.
+      # Now that libwebrtc.lock.json pins an H.264-free libwebrtc this must stay
+      # at zero. It is the regression guard for a LiveKit SDK bump silently
+      # pulling the codecs back in via a new prebuilt libwebrtc.
       - name: Scan for video codecs (ffmpeg / OpenH264)
         shell: pwsh
         run: |
           pwsh -NoProfile -ExecutionPolicy Bypass -File "tools/check-no-video-codecs.ps1" `
-            -Binary "livekit_ffi/target/release/livekit_ffi.dll" -ReportOnly
+            -Binary "livekit_ffi/target/release/livekit_ffi.dll"
 
       - name: Package SDK (headers + libs + dll + pdb)
         shell: pwsh
