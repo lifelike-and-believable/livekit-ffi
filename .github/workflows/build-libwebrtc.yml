@@ -51,13 +51,33 @@ jobs:
             Format-Table -AutoSize | Out-String | Write-Host
           Write-Host "This build needs roughly 60 GB free on the work_dir volume."
 
-      - name: Install Rust 1.87.0 (MSVC)
-        uses: actions-rs/toolchain@v1
-        with:
-          toolchain: 1.87.0
-          profile: minimal
-          target: x86_64-pc-windows-msvc
-          override: true
+      # Installed directly rather than via actions-rs/toolchain: that action is
+      # archived, and on a self-hosted runner without rustup preinstalled it
+      # downloads rustup-init to a temp file with no .exe extension and then
+      # fails to execute it. Only cargo metadata needs the toolchain here --
+      # the libwebrtc build itself is gn/ninja.
+      - name: Ensure Rust 1.87.0 (MSVC)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $cargoBin = Join-Path $env:USERPROFILE ".cargo\bin"
+          if (-not (Test-Path (Join-Path $cargoBin "rustup.exe"))) {
+            Write-Host "rustup not present; installing"
+            $init = Join-Path $env:RUNNER_TEMP "rustup-init.exe"
+            Invoke-WebRequest -Uri "https://win.rustup.rs/x86_64" -OutFile $init
+            & $init -y --default-toolchain none --profile minimal --no-modify-path
+            if ($LASTEXITCODE -ne 0) { throw "rustup-init failed ($LASTEXITCODE)" }
+          }
+          $env:PATH = "$cargoBin;$env:PATH"
+
+          rustup toolchain install 1.87.0 --profile minimal --target x86_64-pc-windows-msvc
+          if ($LASTEXITCODE -ne 0) { throw "rustup toolchain install failed ($LASTEXITCODE)" }
+
+          # Persist for later steps instead of relying on a directory override.
+          $cargoBin | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          "RUSTUP_TOOLCHAIN=1.87.0" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+          & (Join-Path $cargoBin "cargo.exe") --version
 
       - name: Locate Visual Studio 2022
         id: vs
