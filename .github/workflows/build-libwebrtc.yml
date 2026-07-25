@@ -39,7 +39,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Report disk space
         shell: pwsh
@@ -202,7 +202,7 @@ jobs:
           Write-Host ("Packaged {0:N0} bytes" -f (Get-Item $zip).Length)
 
       - name: Upload libwebrtc artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: libwebrtc-win-${{ inputs.arch }}-${{ inputs.profile }}-noh264
           path: artifacts/libwebrtc-win-${{ inputs.arch }}-${{ inputs.profile }}-noh264.zip

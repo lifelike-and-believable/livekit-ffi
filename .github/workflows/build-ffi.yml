@@ -24,15 +24,15 @@ jobs:
       CARGO_TERM_COLOR: always
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
+      # actions-rs/* is archived and targets an EOL Node runtime. This action is
+      # composite (shell only), so it has no Node runtime to deprecate; the
+      # toolchain version comes from the ref.
       - name: Install Rust 1.87.0 (MSVC)
-        uses: actions-rs/toolchain@v1
+        uses: dtolnay/rust-toolchain@1.87.0
         with:
-          toolchain: 1.87.0
-          profile: minimal
-          target: x86_64-pc-windows-msvc
-          override: true
+          targets: x86_64-pc-windows-msvc
 
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
@@ -87,7 +87,7 @@ jobs:
           pwsh -NoProfile -ExecutionPolicy Bypass -File "tools/package.ps1" -CrateDir "livekit_ffi" -OutDir "artifacts/windows-x64"
 
       - name: Upload artifact (SDK)
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: livekit-ffi-sdk-windows-x64
           path: |
@@ -99,7 +99,7 @@ jobs:
           pwsh -NoProfile -ExecutionPolicy Bypass -File "tools/package-plugin.ps1" -CrateDir "livekit_ffi" -OutDir "artifacts/plugin-windows-x64" -ThirdPartyName "livekit_ffi"
 
       - name: Upload artifact (PluginLayout)
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: livekit-ffi-plugin-windows-x64
           path: |
@@ -111,13 +111,13 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Download SDK artifact
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: livekit-ffi-sdk-windows-x64
           path: artifacts/windows-x64
 
       - name: Download Plugin artifact
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: livekit-ffi-plugin-windows-x64
           path: artifacts/plugin-windows-x64
@@ -130,7 +130,7 @@ jobs:
           zip -r ../livekit-ffi-plugin-windows-x64.zip .
 
       - name: Upload to GitHub Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           files: |
             artifacts/livekit-ffi-sdk-windows-x64.zip
