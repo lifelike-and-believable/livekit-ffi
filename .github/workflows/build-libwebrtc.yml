@@ -156,6 +156,20 @@ jobs:
           # Upstream pins Enterprise; use whatever edition this runner has.
           $text = $text -replace '(?m)^set vs2019_install=.*$', "set vs2019_install=$($env:VS_PATH)"
 
+          # Upstream ignores ninja's exit code. The copy/xcopy commands that
+          # follow it reset errorlevel, so a failed compile still exits 0 and
+          # the missing webrtc.lib only surfaces much later. Make it fatal.
+          if ($text -notmatch '(?m)^ninja\.exe -C %OUTPUT_DIR% :default\s*$') {
+            throw "Could not find the ninja invocation in build_windows.cmd - upstream script changed."
+          }
+          # The script uses LF endings; keep them rather than splicing in CRLF.
+          $text = $text -replace '(?m)^(ninja\.exe -C %OUTPUT_DIR% :default)\s*$',
+                                 "`$1`nif errorlevel 1 exit /b 1"
+
+          # /F echoes every copied path, burying the build output under tens of
+          # thousands of lines. /Q keeps the log readable.
+          $text = $text -replace '(xcopy src\\\*\.\w+ "%ARTIFACTS_DIR%\\include") /C /S /I /F /H', '$1 /C /S /I /H /Q'
+
           Set-Content -Path $cmd -Value $text -NoNewline
           Write-Host "--- effective gn args ---"
           Select-String -Path $cmd -Pattern 'is_debug=' | ForEach-Object { $_.Line.Trim() }
@@ -166,6 +180,35 @@ jobs:
         run: |
           call build_windows.cmd --arch ${{ inputs.arch }} --profile ${{ inputs.profile }}
           if errorlevel 1 exit /b 1
+
+      # Belt and braces: even with the ninja guard patched in, confirm the
+      # artifact actually materialised before spending time scanning it, and
+      # dump where the .lib files really landed if it did not.
+      - name: Assert webrtc.lib was produced
+        shell: pwsh
+        env:
+          BUILD_DIR: ${{ steps.stage.outputs.dir }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $art = Join-Path $env:BUILD_DIR "win-${{ inputs.arch }}-${{ inputs.profile }}"
+          $lib = Join-Path $art "lib\webrtc.lib"
+          if (Test-Path $lib) {
+            Write-Host ("OK: webrtc.lib present ({0:N0} bytes)" -f (Get-Item $lib).Length)
+            exit 0
+          }
+
+          Write-Host "webrtc.lib missing from $art -- diagnostics:"
+          Write-Host "--- artifact dir ---"
+          Get-ChildItem $art -ErrorAction SilentlyContinue |
+            Select-Object Name, Length | Format-Table -AutoSize | Out-String | Write-Host
+
+          $out = Join-Path $env:BUILD_DIR "src\out-${{ inputs.arch }}-${{ inputs.profile }}"
+          Write-Host "--- largest .lib under $out ---"
+          Get-ChildItem $out -Filter *.lib -Recurse -ErrorAction SilentlyContinue |
+            Sort-Object Length -Descending | Select-Object -First 15 FullName, Length |
+            Format-Table -AutoSize | Out-String | Write-Host
+
+          throw "ninja did not produce webrtc.lib - see diagnostics above."
 
       - name: Verify H.264 is absent
         shell: pwsh
