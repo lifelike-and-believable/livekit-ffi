@@ -175,8 +175,11 @@ jobs:
                                  "call ninja `$1`nif errorlevel 1 exit /b 1"
 
           # /F echoes every copied path, burying the build output under tens of
-          # thousands of lines. /Q keeps the log readable.
-          $text = $text -replace '(xcopy src\\\*\.\w+ "%ARTIFACTS_DIR%\\include") /C /S /I /F /H', '$1 /C /S /I /H /Q'
+          # thousands of lines; /Q keeps the log readable. /Y is required for
+          # reruns: xcopy prompts before overwriting, and unlike `copy` it gets
+          # no automatic yes inside a batch file, so with no stdin in CI the
+          # second run into a populated artifact dir hangs then fails.
+          $text = $text -replace '(xcopy src\\\*\.\w+ "%ARTIFACTS_DIR%\\include") /C /S /I /F /H', '$1 /C /S /I /H /Q /Y'
 
           Set-Content -Path $cmd -Value $text -NoNewline
           Write-Host "--- effective gn args ---"
