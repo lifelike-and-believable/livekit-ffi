@@ -30,6 +30,13 @@ on:
           instead of re-syncing from scratch.
         required: true
         default: "C:\\lk-webrtc"
+      release_tag:
+        description: >-
+          Publish the zip as an asset on this release tag, giving a stable
+          anonymously-downloadable URL for libwebrtc.lock.json. Leave empty to
+          only upload a (90-day, auth-required) Actions artifact.
+        required: false
+        default: ""
 
 jobs:
   build:
@@ -39,7 +46,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Report disk space
         shell: pwsh
@@ -51,13 +58,33 @@ jobs:
             Format-Table -AutoSize | Out-String | Write-Host
           Write-Host "This build needs roughly 60 GB free on the work_dir volume."
 
-      - name: Install Rust 1.87.0 (MSVC)
-        uses: actions-rs/toolchain@v1
-        with:
-          toolchain: 1.87.0
-          profile: minimal
-          target: x86_64-pc-windows-msvc
-          override: true
+      # Installed directly rather than via actions-rs/toolchain: that action is
+      # archived, and on a self-hosted runner without rustup preinstalled it
+      # downloads rustup-init to a temp file with no .exe extension and then
+      # fails to execute it. Only cargo metadata needs the toolchain here --
+      # the libwebrtc build itself is gn/ninja.
+      - name: Ensure Rust 1.87.0 (MSVC)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $cargoBin = Join-Path $env:USERPROFILE ".cargo\bin"
+          if (-not (Test-Path (Join-Path $cargoBin "rustup.exe"))) {
+            Write-Host "rustup not present; installing"
+            $init = Join-Path $env:RUNNER_TEMP "rustup-init.exe"
+            Invoke-WebRequest -Uri "https://win.rustup.rs/x86_64" -OutFile $init
+            & $init -y --default-toolchain none --profile minimal --no-modify-path
+            if ($LASTEXITCODE -ne 0) { throw "rustup-init failed ($LASTEXITCODE)" }
+          }
+          $env:PATH = "$cargoBin;$env:PATH"
+
+          rustup toolchain install 1.87.0 --profile minimal --target x86_64-pc-windows-msvc
+          if ($LASTEXITCODE -ne 0) { throw "rustup toolchain install failed ($LASTEXITCODE)" }
+
+          # Persist for later steps instead of relying on a directory override.
+          $cargoBin | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          "RUSTUP_TOOLCHAIN=1.87.0" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+          & (Join-Path $cargoBin "cargo.exe") --version
 
       - name: Locate Visual Studio 2022
         id: vs
@@ -105,6 +132,7 @@ jobs:
           Copy-Item -Path (Join-Path $src "*") -Destination $dest -Recurse -Force
           "dir=$dest" >> $env:GITHUB_OUTPUT
           "webrtc_ref=$($Matches.ref)" >> $env:GITHUB_OUTPUT
+          "webrtc_sys_version=$version" >> $env:GITHUB_OUTPUT
 
       - name: Disable H.264 in the gn args
         shell: pwsh
@@ -136,9 +164,46 @@ jobs:
           # Upstream pins Enterprise; use whatever edition this runner has.
           $text = $text -replace '(?m)^set vs2019_install=.*$', "set vs2019_install=$($env:VS_PATH)"
 
+          # Two problems with the upstream ninja line.
+          #
+          # 1. It invokes `ninja.exe`, but depot_tools no longer bundles that
+          #    binary -- ninja is CIPD-managed and reached through ninja.bat.
+          #    Dropping the extension lets cmd resolve whichever launcher this
+          #    depot_tools revision actually ships, via PATHEXT. `call` is
+          #    required so control returns here when it resolves to a .bat;
+          #    without it the rest of the script would never run.
+          # 2. Its exit code is ignored. The copy/xcopy commands that follow
+          #    reset errorlevel, so a failed (or missing) compile still exits 0
+          #    and the absent webrtc.lib only surfaces much later.
+          if ($text -notmatch '(?m)^ninja\.exe -C %OUTPUT_DIR% :default\s*$') {
+            throw "Could not find the ninja invocation in build_windows.cmd - upstream script changed."
+          }
+          # The script uses LF endings; keep them rather than splicing in CRLF.
+          $text = $text -replace '(?m)^ninja\.exe (-C %OUTPUT_DIR% :default)\s*$',
+                                 "call ninja `$1`nif errorlevel 1 exit /b 1"
+
+          # /F echoes every copied path, burying the build output under tens of
+          # thousands of lines; /Q keeps the log readable. /Y is required for
+          # reruns: xcopy prompts before overwriting, and unlike `copy` it gets
+          # no automatic yes inside a batch file, so with no stdin in CI the
+          # second run into a populated artifact dir hangs then fails.
+          $text = $text -replace '(xcopy src\\\*\.\w+ "%ARTIFACTS_DIR%\\include") /C /S /I /F /H', '$1 /C /S /I /H /Q /Y'
+
           Set-Content -Path $cmd -Value $text -NoNewline
           Write-Host "--- effective gn args ---"
           Select-String -Path $cmd -Pattern 'is_debug=' | ForEach-Object { $_.Line.Trim() }
+          Write-Host "--- ninja invocation ---"
+          Select-String -Path $cmd -Pattern 'call ninja' | ForEach-Object { $_.Line.Trim() }
+
+          # Which ninja launcher this depot_tools revision ships. Informational:
+          # on a clean machine build_windows.cmd clones depot_tools itself, so
+          # this is empty on the first run.
+          $dt = Join-Path $env:BUILD_DIR "depot_tools"
+          if (Test-Path $dt) {
+            Write-Host "--- ninja launchers in depot_tools ---"
+            Get-ChildItem $dt -Filter "*ninja*" -ErrorAction SilentlyContinue |
+              ForEach-Object { Write-Host "  $($_.Name)" }
+          }
 
       - name: Build libwebrtc
         shell: cmd
@@ -146,6 +211,35 @@ jobs:
         run: |
           call build_windows.cmd --arch ${{ inputs.arch }} --profile ${{ inputs.profile }}
           if errorlevel 1 exit /b 1
+
+      # Belt and braces: even with the ninja guard patched in, confirm the
+      # artifact actually materialised before spending time scanning it, and
+      # dump where the .lib files really landed if it did not.
+      - name: Assert webrtc.lib was produced
+        shell: pwsh
+        env:
+          BUILD_DIR: ${{ steps.stage.outputs.dir }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $art = Join-Path $env:BUILD_DIR "win-${{ inputs.arch }}-${{ inputs.profile }}"
+          $lib = Join-Path $art "lib\webrtc.lib"
+          if (Test-Path $lib) {
+            Write-Host ("OK: webrtc.lib present ({0:N0} bytes)" -f (Get-Item $lib).Length)
+            exit 0
+          }
+
+          Write-Host "webrtc.lib missing from $art -- diagnostics:"
+          Write-Host "--- artifact dir ---"
+          Get-ChildItem $art -ErrorAction SilentlyContinue |
+            Select-Object Name, Length | Format-Table -AutoSize | Out-String | Write-Host
+
+          $out = Join-Path $env:BUILD_DIR "src\out-${{ inputs.arch }}-${{ inputs.profile }}"
+          Write-Host "--- largest .lib under $out ---"
+          Get-ChildItem $out -Filter *.lib -Recurse -ErrorAction SilentlyContinue |
+            Sort-Object Length -Descending | Select-Object -First 15 FullName, Length |
+            Format-Table -AutoSize | Out-String | Write-Host
+
+          throw "ninja did not produce webrtc.lib - see diagnostics above."
 
       - name: Verify H.264 is absent
         shell: pwsh
@@ -169,6 +263,7 @@ jobs:
           & "$env:GITHUB_WORKSPACE\tools\check-no-video-codecs.ps1" -Binary (Join-Path $art "lib\webrtc.lib")
 
       - name: Package artifact
+        id: package
         shell: pwsh
         env:
           BUILD_DIR: ${{ steps.stage.outputs.dir }}
@@ -179,11 +274,59 @@ jobs:
           $zip = "$env:GITHUB_WORKSPACE\artifacts\libwebrtc-win-${{ inputs.arch }}-${{ inputs.profile }}-noh264.zip"
           if (Test-Path $zip) { Remove-Item $zip -Force }
           Compress-Archive -Path "$art\*" -DestinationPath $zip -CompressionLevel Optimal
+
+          # Emit the digest of the zip itself. build-ffi.yml verifies the
+          # download against the value recorded in libwebrtc.lock.json, so this
+          # is what goes in that file -- not the Actions artifact digest, which
+          # covers the upload wrapper rather than this file.
+          $sha = (Get-FileHash -LiteralPath $zip -Algorithm SHA256).Hash.ToLower()
           Write-Host ("Packaged {0:N0} bytes" -f (Get-Item $zip).Length)
+          Write-Host "sha256: $sha"
+          "sha256=$sha" >> $env:GITHUB_OUTPUT
 
       - name: Upload libwebrtc artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: libwebrtc-win-${{ inputs.arch }}-${{ inputs.profile }}-noh264
           path: artifacts/libwebrtc-win-${{ inputs.arch }}-${{ inputs.profile }}-noh264.zip
           retention-days: 90
+
+      # Actions artifacts expire and need auth to fetch, so they cannot be
+      # consumed by build-ffi.yml. Publishing to a release gives a stable,
+      # anonymously downloadable URL on this public repo.
+      - name: Publish as a release asset
+        if: inputs.release_tag != ''
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ inputs.release_tag }}
+          name: ${{ inputs.release_tag }}
+          files: artifacts/libwebrtc-win-${{ inputs.arch }}-${{ inputs.profile }}-noh264.zip
+          body: |
+            libwebrtc for `win-${{ inputs.arch }}-${{ inputs.profile }}` built with H.264 disabled
+            (`rtc_use_h264=false`), which drops ffmpeg (libavcodec/libavutil, LGPL) and
+            OpenH264 from the artifact. VP8/VP9/AV1 and Opus are retained.
+
+            Consumed by `build-ffi.yml` via `LK_CUSTOM_WEBRTC`; the URL and digest are
+            pinned in `libwebrtc.lock.json`. See `docs/WEBRTC_CODEC_REMOVAL.md`.
+
+            - webrtc-sys: `${{ steps.stage.outputs.webrtc_sys_version }}`
+            - WebRTC: `${{ steps.stage.outputs.webrtc_ref }}`
+            - Built from: `${{ github.sha }}`
+            - SHA256: `${{ steps.package.outputs.sha256 }}`
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Summary
+        shell: pwsh
+        run: |
+          $lines = @(
+            "### libwebrtc (no H.264) - win-${{ inputs.arch }}-${{ inputs.profile }}",
+            "",
+            "| Field | Value |",
+            "| --- | --- |",
+            "| webrtc-sys | ``${{ steps.stage.outputs.webrtc_sys_version }}`` |",
+            "| WebRTC | ``${{ steps.stage.outputs.webrtc_ref }}`` |",
+            "| SHA256 | ``${{ steps.package.outputs.sha256 }}`` |",
+            "| Release tag | ``${{ inputs.release_tag }}`` |"
+          )
+          $lines -join "`n" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Append

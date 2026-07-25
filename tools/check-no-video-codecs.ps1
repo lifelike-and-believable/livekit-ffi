@@ -14,7 +14,12 @@ function Die($msg)  { Write-Error $msg; exit 1 }
 $RepoRoot = Split-Path -Parent $PSCommandPath
 $RepoRoot = Split-Path -Parent $RepoRoot  # tools -> repo root
 
-if (-not (Test-Path $Binary)) { $Binary = Join-Path $RepoRoot $Binary }
+# Only fall back to a repo-relative path when the caller passed a relative one.
+# Join-Path would otherwise splice the repo root onto an already-absolute path
+# and report a nonsense location for a file that is simply missing.
+if (-not [System.IO.Path]::IsPathRooted($Binary) -and -not (Test-Path $Binary)) {
+  $Binary = Join-Path $RepoRoot $Binary
+}
 if (-not (Test-Path $Binary)) { Die "[codec-scan] Binary not found: $Binary (build first)" }
 
 # ffmpeg (libavcodec/libavutil) is LGPL and OpenH264 carries Cisco's binary
