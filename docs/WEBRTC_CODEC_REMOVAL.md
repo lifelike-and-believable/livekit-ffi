@@ -13,17 +13,24 @@ bytes. Because nothing calls into them, removal costs zero functionality.
 ## Where the codecs come from
 
 `webrtc-sys` does not build libwebrtc. It downloads a prebuilt archive that
-LiveKit publishes, produced by `webrtc-sys/libwebrtc/build_windows.cmd` in
-[`livekit/client-sdk-rust`](https://github.com/livekit/client-sdk-rust). That
-script hardcodes the gn args:
+LiveKit publishes, produced by `libwebrtc/build_windows.cmd` — a script vendored
+inside the `webrtc-sys` crate itself. That script hardcodes the gn args:
 
 ```
 rtc_use_h264=true ffmpeg_branding="Chrome"
 ```
 
-That single flag is the entire origin of the ffmpeg and OpenH264 bytes. In the
-WebRTC tree LiveKit builds ([`webrtc-sdk/webrtc@m144_release`](https://github.com/webrtc-sdk/webrtc)),
-`modules/video_coding/BUILD.gn` gates only the *dependencies* on it:
+That single flag is the entire origin of the ffmpeg and OpenH264 bytes.
+
+This project pins `webrtc-sys 0.3.16` (via `livekit =0.7.24`), whose `.gclient`
+targets [`webrtc-sdk/webrtc@m137_release`](https://github.com/webrtc-sdk/webrtc).
+Note that `client-sdk-rust`'s `main` is far ahead — `webrtc-sys 0.3.39` on
+`m144_release` — so the build scripts must come from the pinned crate, not from
+a clone of that repo. `build-libwebrtc.yml` resolves them via `cargo metadata`
+for exactly this reason.
+
+In that tree, `modules/video_coding/BUILD.gn` gates only the *dependencies* on
+`rtc_use_h264`:
 
 ```gn
 rtc_library("webrtc_h264") {
@@ -93,9 +100,9 @@ arguments it cannot resolve. `build-libwebrtc.yml` removes it instead.
 
 1. Run the **Build libwebrtc (no H.264)** workflow
    (`.github/workflows/build-libwebrtc.yml`) on the self-hosted Windows runner.
-   It clones `client-sdk-rust`, rewrites the gn args, builds, and asserts that
-   the resulting `webrtc.ninja` carries no `-DWEBRTC_USE_H264` and that
-   `webrtc.lib` has no ffmpeg/OpenH264 markers.
+   It stages the build scripts out of the pinned `webrtc-sys` crate, rewrites
+   the gn args, builds, and asserts that the resulting `webrtc.ninja` carries no
+   `-DWEBRTC_USE_H264` and that `webrtc.lib` has no ffmpeg/OpenH264 markers.
 
    It is `workflow_dispatch` only and needs roughly 60 GB free plus several
    hours. Never wire it to push or PR — build once per libwebrtc bump.
