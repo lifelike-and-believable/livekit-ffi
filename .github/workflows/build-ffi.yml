@@ -12,6 +12,14 @@ on:
       - 'tools/**'
       - '.github/workflows/build-ffi.yml'
   workflow_dispatch:
+    inputs:
+      release_tag:
+        description: >-
+          Publish the SDK and plugin zips as assets on this release tag,
+          creating the release if it does not exist. Leave empty to only build
+          and upload (90-day, auth-required) Actions artifacts.
+        required: false
+        default: ""
   release:
     types: [published]
 
@@ -132,7 +140,14 @@ jobs:
             artifacts/plugin-windows-x64/**
 
   release-assets:
-    if: ${{ github.event_name == 'release' && github.event.action == 'published' && !startsWith(github.event.release.tag_name, 'libwebrtc-') }}
+    # Runs either from a published release, or from a manual dispatch carrying a
+    # release_tag. The dispatch path exists because a release cut from the
+    # GitHub UI cannot be produced from here, and because the assets must be
+    # anonymously downloadable for downstream consumers to vendor them.
+    if: >-
+      ${{ (github.event_name == 'release' && github.event.action == 'published'
+           && !startsWith(github.event.release.tag_name, 'libwebrtc-'))
+          || (github.event_name == 'workflow_dispatch' && inputs.release_tag != '') }}
     needs: [windows-msvc]
     runs-on: ubuntu-latest
     steps:
@@ -155,9 +170,26 @@ jobs:
           cd ../plugin-windows-x64
           zip -r ../livekit-ffi-plugin-windows-x64.zip .
 
+      # Digests for the downstream SHA256 inventory. Consumers vendoring these
+      # binaries need to record what they actually shipped.
+      - name: Report digests
+        run: |
+          cd artifacts
+          sha256sum livekit-ffi-sdk-windows-x64.zip livekit-ffi-plugin-windows-x64.zip | tee digests.txt
+          {
+            echo "### Release assets"
+            echo
+            echo '```'
+            cat digests.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
       - name: Upload to GitHub Release
         uses: softprops/action-gh-release@v3
         with:
+          # On a release event this is empty and the action targets the
+          # triggering release; on dispatch it names (and creates) the tag.
+          tag_name: ${{ inputs.release_tag }}
           files: |
             artifacts/livekit-ffi-sdk-windows-x64.zip
             artifacts/livekit-ffi-plugin-windows-x64.zip
