@@ -60,7 +60,7 @@ panic = "abort"
 # Metadata for documentation & CI
 # ───────────────────────────────────────────────
 [package.metadata]
-repository = "https://github.com/lifelike-and-believable/livekit-ffi-ue"
+repository = "https://github.com/lifelike-and-believable/livekit-ffi"
 readme = "../README.md"
 
 # ───────────────────────────────────────────────
