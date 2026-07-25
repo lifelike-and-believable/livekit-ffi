@@ -1,0 +1,50 @@
+name: Delete release asset
+
+# Maintenance helper. build-ffi.yml and build-libwebrtc.yml both attach assets
+# to a release tag, and action-gh-release only ever adds or replaces by name --
+# it cannot remove one. This is the counterpart, for when an asset lands on the
+# wrong tag or a name is retired.
+#
+# Deleting a published asset is destructive and irreversible: anything pinning
+# that URL breaks. Check for a libwebrtc.lock.json (or a downstream equivalent)
+# referencing it first.
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to remove the asset from (e.g. v0.2.0)"
+        required: true
+      asset:
+        description: "Exact asset filename to delete (e.g. livekit-ffi-sdk-windows-x64.zip)"
+        required: true
+
+jobs:
+  delete:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Show the asset before deleting
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          echo "Assets currently on ${{ inputs.tag }}:"
+          gh release view "${{ inputs.tag }}" -R "${{ github.repository }}" \
+            --json assets --jq '.assets[] | "  \(.name)  \(.size) bytes"'
+          gh release view "${{ inputs.tag }}" -R "${{ github.repository }}" \
+            --json assets --jq '.assets[].name' | grep -qx -- '${{ inputs.asset }}' \
+            || { echo "::error::No asset named '${{ inputs.asset }}' on tag '${{ inputs.tag }}'"; exit 1; }
+
+      - name: Delete
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          gh release delete-asset "${{ inputs.tag }}" "${{ inputs.asset }}" \
+            --yes -R "${{ github.repository }}"
+          echo "Deleted '${{ inputs.asset }}' from '${{ inputs.tag }}'."
+          echo "Remaining assets:"
+          gh release view "${{ inputs.tag }}" -R "${{ github.repository }}" \
+            --json assets --jq '.assets[] | "  \(.name)"'
