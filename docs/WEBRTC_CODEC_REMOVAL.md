@@ -139,15 +139,17 @@ arguments it cannot resolve. `build-libwebrtc.yml` removes it instead.
    trigger an SDK build in `build-ffi.yml` — otherwise it would attach
    `livekit_ffi` zips, built against the old libwebrtc, to a libwebrtc release.
 
-3. Flip the **Scan for video codecs** step in `build-ffi.yml` from `-ReportOnly`
-   to a hard failure. Without that, this regresses the first time someone bumps
-   the LiveKit SDK.
-
 ## Verification
 
 `tools/check-no-video-codecs.ps1` scans a binary for `libavcodec`, `libavutil`,
 `avcodec_*`, `av_frame_*`, `openh264`, `WelsEnc`, `WelsDec` and `ISVCEncoder`.
-It runs in CI against the release DLL. All counts must reach zero.
+It runs in CI against the release DLL as a **hard failure**, and in
+`build-libwebrtc.yml` against `webrtc.lib`. All counts must be zero.
+
+That gate is the point: without it this silently regresses the first time
+someone bumps the LiveKit SDK and picks up a new prebuilt libwebrtc. If it ever
+fires, the fix is to rebuild libwebrtc for the new `webrtc-sys` and update
+`libwebrtc.lock.json` — not to relax the scan.
 
 A symbol scan proves the codecs are gone; it does not prove mocap and Opus audio
 still flow. That still needs a functional pass against Unreal and a real LiveKit

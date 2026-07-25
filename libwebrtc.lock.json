@@ -1,0 +1,9 @@
+{
+  "comment": "H.264-free libwebrtc consumed by build-ffi.yml via LK_CUSTOM_WEBRTC. Produced by .github/workflows/build-libwebrtc.yml; see docs/WEBRTC_CODEC_REMOVAL.md. Built with rtc_use_h264=false, which drops ffmpeg (libavcodec/libavutil, LGPL) and OpenH264. Regenerate by dispatching that workflow with a new release_tag, then update url/sha256/release_tag/built_from_commit here.",
+  "url": "https://github.com/lifelike-and-believable/livekit-ffi/releases/download/libwebrtc-m137-noh264-1/libwebrtc-win-x64-release-noh264.zip",
+  "sha256": "25d0d7aeea722fc9688e39e3f391f5bb88740ec4d740dd7d3993a4436317163d",
+  "release_tag": "libwebrtc-m137-noh264-1",
+  "webrtc_sys": "0.3.16",
+  "webrtc_milestone": "m137_release",
+  "built_from_commit": "9a7481070fddd1e8baacd07d5c228cec468c56a6"
+}
