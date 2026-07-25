@@ -107,13 +107,37 @@ arguments it cannot resolve. `build-libwebrtc.yml` removes it instead.
    It is `workflow_dispatch` only and needs roughly 60 GB free plus several
    hours. Never wire it to push or PR — build once per libwebrtc bump.
 
-2. Publish the resulting zip and set the repository variable
-   `LK_WEBRTC_ASSET_URL` to its download URL. `build-ffi.yml` then extracts it,
-   points `LK_CUSTOM_WEBRTC` at it, and `webrtc-sys` skips its prebuilt
-   download. Until that variable is set the build is unchanged.
+   Pass a `release_tag` (by convention `libwebrtc-*`) to publish the zip as a
+   release asset. Actions artifacts expire after 90 days and need auth to
+   fetch, so they cannot be consumed by `build-ffi.yml`; a release asset on
+   this public repo is stable and anonymously downloadable.
+
+2. Record the asset in `libwebrtc.lock.json` at the repo root:
+
+   ```json
+   {
+     "url": "https://github.com/<owner>/<repo>/releases/download/<tag>/libwebrtc-win-x64-release-noh264.zip",
+     "sha256": "<digest printed by the Package artifact step>",
+     "release_tag": "<tag>",
+     "webrtc_sys": "0.3.16",
+     "webrtc_milestone": "m137_release",
+     "built_from_commit": "<sha>"
+   }
+   ```
+
+   `build-ffi.yml` downloads that URL, verifies the digest, and points
+   `LK_CUSTOM_WEBRTC` at the extracted tree, so `webrtc-sys` skips its prebuilt
+   download. Pinning it in-repo rather than in a repository variable keeps the
+   DLL reproducible from the repo alone and puts the provenance in the diff.
+   With no lockfile, or no `url` in it, the build is unchanged. A `url` with no
+   `sha256` is rejected rather than silently trusted.
 
    `LK_CUSTOM_WEBRTC` must contain `include/`, `lib/webrtc.lib` and
    `webrtc.ninja` at its root.
+
+   Note that publishing a `libwebrtc-*` release deliberately does **not**
+   trigger an SDK build in `build-ffi.yml` — otherwise it would attach
+   `livekit_ffi` zips, built against the old libwebrtc, to a libwebrtc release.
 
 3. Flip the **Scan for video codecs** step in `build-ffi.yml` from `-ReportOnly`
    to a hard failure. Without that, this regresses the first time someone bumps

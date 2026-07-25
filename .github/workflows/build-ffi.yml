@@ -18,6 +18,10 @@ on:
 jobs:
   windows-msvc:
     name: Windows (MSVC) Release
+    # libwebrtc-* releases carry a libwebrtc toolchain artifact, not an SDK
+    # release. Without this guard, publishing one would build the SDK and
+    # attach livekit_ffi zips to it.
+    if: ${{ github.event_name != 'release' || !startsWith(github.event.release.tag_name, 'libwebrtc-') }}
     runs-on: windows-latest
     env:
       RUSTFLAGS: -C target-feature=+crt-static
@@ -40,21 +44,43 @@ jobs:
           workspaces: |
             livekit_ffi
 
-      # Opt-in: point at an H.264-free libwebrtc produced by build-libwebrtc.yml.
-      # Set the LK_WEBRTC_ASSET_URL repository variable to a zip of the
-      # win-x64-release artifact. While it is unset the build keeps using the
-      # prebuilt libwebrtc that webrtc-sys downloads by default, so this step is
-      # a no-op until the clean artifact exists.
+      # Consume the H.264-free libwebrtc built by build-libwebrtc.yml. Its URL
+      # and digest are pinned in libwebrtc.lock.json rather than a repository
+      # variable, so the DLL is reproducible from the repo alone and the
+      # provenance is reviewable in the diff. With no lockfile (or no url in
+      # it) the build falls back to the prebuilt libwebrtc that webrtc-sys
+      # downloads by default, which still contains H.264.
       - name: Restore custom libwebrtc (no H.264)
-        if: vars.LK_WEBRTC_ASSET_URL != ''
         id: webrtc
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
+          $lockPath = Join-Path $env:GITHUB_WORKSPACE "libwebrtc.lock.json"
+          if (-not (Test-Path $lockPath)) {
+            Write-Host "No libwebrtc.lock.json - using the webrtc-sys prebuilt (H.264 present)."
+            exit 0
+          }
+          $lock = Get-Content $lockPath -Raw | ConvertFrom-Json
+          if ([string]::IsNullOrWhiteSpace($lock.url)) {
+            Write-Host "libwebrtc.lock.json has no url - using the webrtc-sys prebuilt (H.264 present)."
+            exit 0
+          }
+          if ([string]::IsNullOrWhiteSpace($lock.sha256)) {
+            throw "libwebrtc.lock.json has a url but no sha256; refusing to use an unverified build."
+          }
+
           $dest = Join-Path $env:RUNNER_TEMP "libwebrtc"
           $zip  = Join-Path $env:RUNNER_TEMP "libwebrtc.zip"
+          Write-Host "Fetching $($lock.url)"
+          Invoke-WebRequest -Uri $lock.url -OutFile $zip
+
+          $sha = (Get-FileHash -LiteralPath $zip -Algorithm SHA256).Hash.ToLower()
+          if ($sha -ne $lock.sha256.ToLower()) {
+            throw "libwebrtc digest mismatch.`n  expected $($lock.sha256)`n  got      $sha"
+          }
+          Write-Host "sha256 verified: $sha"
+
           New-Item -ItemType Directory -Force -Path $dest | Out-Null
-          Invoke-WebRequest -Uri "${{ vars.LK_WEBRTC_ASSET_URL }}" -OutFile $zip
           Expand-Archive -Path $zip -DestinationPath $dest -Force
           # webrtc-sys requires include/, lib/webrtc.lib and webrtc.ninja at the
           # root of LK_CUSTOM_WEBRTC.
@@ -106,7 +132,7 @@ jobs:
             artifacts/plugin-windows-x64/**
 
   release-assets:
-    if: ${{ github.event_name == 'release' && github.event.action == 'published' }}
+    if: ${{ github.event_name == 'release' && github.event.action == 'published' && !startsWith(github.event.release.tag_name, 'libwebrtc-') }}
     needs: [windows-msvc]
     runs-on: ubuntu-latest
     steps:
