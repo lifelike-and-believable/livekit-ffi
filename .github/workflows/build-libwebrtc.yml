@@ -156,15 +156,23 @@ jobs:
           # Upstream pins Enterprise; use whatever edition this runner has.
           $text = $text -replace '(?m)^set vs2019_install=.*$', "set vs2019_install=$($env:VS_PATH)"
 
-          # Upstream ignores ninja's exit code. The copy/xcopy commands that
-          # follow it reset errorlevel, so a failed compile still exits 0 and
-          # the missing webrtc.lib only surfaces much later. Make it fatal.
+          # Two problems with the upstream ninja line.
+          #
+          # 1. It invokes `ninja.exe`, but depot_tools no longer bundles that
+          #    binary -- ninja is CIPD-managed and reached through ninja.bat.
+          #    Dropping the extension lets cmd resolve whichever launcher this
+          #    depot_tools revision actually ships, via PATHEXT. `call` is
+          #    required so control returns here when it resolves to a .bat;
+          #    without it the rest of the script would never run.
+          # 2. Its exit code is ignored. The copy/xcopy commands that follow
+          #    reset errorlevel, so a failed (or missing) compile still exits 0
+          #    and the absent webrtc.lib only surfaces much later.
           if ($text -notmatch '(?m)^ninja\.exe -C %OUTPUT_DIR% :default\s*$') {
             throw "Could not find the ninja invocation in build_windows.cmd - upstream script changed."
           }
           # The script uses LF endings; keep them rather than splicing in CRLF.
-          $text = $text -replace '(?m)^(ninja\.exe -C %OUTPUT_DIR% :default)\s*$',
-                                 "`$1`nif errorlevel 1 exit /b 1"
+          $text = $text -replace '(?m)^ninja\.exe (-C %OUTPUT_DIR% :default)\s*$',
+                                 "call ninja `$1`nif errorlevel 1 exit /b 1"
 
           # /F echoes every copied path, burying the build output under tens of
           # thousands of lines. /Q keeps the log readable.
@@ -173,6 +181,18 @@ jobs:
           Set-Content -Path $cmd -Value $text -NoNewline
           Write-Host "--- effective gn args ---"
           Select-String -Path $cmd -Pattern 'is_debug=' | ForEach-Object { $_.Line.Trim() }
+          Write-Host "--- ninja invocation ---"
+          Select-String -Path $cmd -Pattern 'call ninja' | ForEach-Object { $_.Line.Trim() }
+
+          # Which ninja launcher this depot_tools revision ships. Informational:
+          # on a clean machine build_windows.cmd clones depot_tools itself, so
+          # this is empty on the first run.
+          $dt = Join-Path $env:BUILD_DIR "depot_tools"
+          if (Test-Path $dt) {
+            Write-Host "--- ninja launchers in depot_tools ---"
+            Get-ChildItem $dt -Filter "*ninja*" -ErrorAction SilentlyContinue |
+              ForEach-Object { Write-Host "  $($_.Name)" }
+          }
 
       - name: Build libwebrtc
         shell: cmd
