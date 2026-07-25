@@ -40,12 +40,46 @@ jobs:
           workspaces: |
             livekit_ffi
 
+      # Opt-in: point at an H.264-free libwebrtc produced by build-libwebrtc.yml.
+      # Set the LK_WEBRTC_ASSET_URL repository variable to a zip of the
+      # win-x64-release artifact. While it is unset the build keeps using the
+      # prebuilt libwebrtc that webrtc-sys downloads by default, so this step is
+      # a no-op until the clean artifact exists.
+      - name: Restore custom libwebrtc (no H.264)
+        if: vars.LK_WEBRTC_ASSET_URL != ''
+        id: webrtc
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $dest = Join-Path $env:RUNNER_TEMP "libwebrtc"
+          $zip  = Join-Path $env:RUNNER_TEMP "libwebrtc.zip"
+          New-Item -ItemType Directory -Force -Path $dest | Out-Null
+          Invoke-WebRequest -Uri "${{ vars.LK_WEBRTC_ASSET_URL }}" -OutFile $zip
+          Expand-Archive -Path $zip -DestinationPath $dest -Force
+          # webrtc-sys requires include/, lib/webrtc.lib and webrtc.ninja at the
+          # root of LK_CUSTOM_WEBRTC.
+          foreach ($p in @("include", "lib\webrtc.lib", "webrtc.ninja")) {
+            if (-not (Test-Path (Join-Path $dest $p))) { throw "Custom libwebrtc missing: $p" }
+          }
+          "LK_CUSTOM_WEBRTC=$dest" >> $env:GITHUB_ENV
+          Write-Host "Using custom libwebrtc at $dest"
+
       - name: Build (Release, with_livekit)
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
           cd livekit_ffi
           cargo build --release --features with_livekit
+
+      # Guards against ffmpeg (LGPL) and OpenH264 re-entering the shipped DLL.
+      # Report-only until the H.264-free libwebrtc lands -- the current prebuilt
+      # libwebrtc is built with rtc_use_h264=true, so this reports hits today by
+      # design. Flip to a hard failure once a clean build is in use.
+      - name: Scan for video codecs (ffmpeg / OpenH264)
+        shell: pwsh
+        run: |
+          pwsh -NoProfile -ExecutionPolicy Bypass -File "tools/check-no-video-codecs.ps1" `
+            -Binary "livekit_ffi/target/release/livekit_ffi.dll" -ReportOnly
 
       - name: Package SDK (headers + libs + dll + pdb)
         shell: pwsh

@@ -1,0 +1,172 @@
+name: Build libwebrtc (no H.264)
+
+# Builds a custom libwebrtc with H.264 disabled, which drops ffmpeg
+# (libavcodec/libavutil, LGPL) and OpenH264 (Cisco patent grant) from the
+# artifact. See docs/webrtc-codec-removal.md for the verified mechanism.
+#
+# This is a multi-hour, tens-of-GB depot_tools build. It is deliberately
+# workflow_dispatch only -- never wire it to push/PR. Build once per libwebrtc
+# bump, then consume the published artifact from build-ffi.yml.
+
+on:
+  workflow_dispatch:
+    inputs:
+      client_sdk_ref:
+        description: "client-sdk-rust git ref supplying the libwebrtc build scripts"
+        required: true
+        default: "main"
+      arch:
+        description: "Target architecture"
+        required: true
+        default: "x64"
+        type: choice
+        options: [x64, arm64]
+      profile:
+        description: "Build profile"
+        required: true
+        default: "release"
+        type: choice
+        options: [release, debug]
+      work_dir:
+        description: >-
+          Persistent build directory OUTSIDE the runner workspace. Keeping the
+          ~30-40 GB depot_tools/gclient checkout here lets reruns be incremental
+          instead of re-syncing from scratch.
+        required: true
+        default: "C:\\lk-webrtc"
+
+jobs:
+  build:
+    name: libwebrtc ${{ inputs.arch }}-${{ inputs.profile }} (no H.264)
+    runs-on: [self-hosted, Windows, X64, ue5]
+    timeout-minutes: 600
+
+    steps:
+      - name: Checkout (this repo)
+        uses: actions/checkout@v4
+
+      - name: Report disk space
+        shell: pwsh
+        run: |
+          Get-PSDrive -PSProvider FileSystem |
+            Select-Object Name,
+              @{n='UsedGB';e={[math]::Round($_.Used/1GB,1)}},
+              @{n='FreeGB';e={[math]::Round($_.Free/1GB,1)}} |
+            Format-Table -AutoSize | Out-String | Write-Host
+          Write-Host "This build needs roughly 60 GB free on the work_dir volume."
+
+      - name: Locate Visual Studio 2022
+        id: vs
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          if (-not (Test-Path $vswhere)) { throw "vswhere.exe not found - Visual Studio 2022 required" }
+          $path = & $vswhere -latest -products * `
+            -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 `
+            -property installationPath
+          if (-not $path) { throw "No Visual Studio install with the C++ toolset was found" }
+          Write-Host "Visual Studio: $path"
+          "path=$path" >> $env:GITHUB_OUTPUT
+
+      - name: Sync client-sdk-rust build scripts
+        shell: pwsh
+        env:
+          WORK_DIR: ${{ inputs.work_dir }}
+          SDK_REF: ${{ inputs.client_sdk_ref }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          New-Item -ItemType Directory -Force -Path $env:WORK_DIR | Out-Null
+          $sdk = Join-Path $env:WORK_DIR "client-sdk-rust"
+          if (-not (Test-Path (Join-Path $sdk ".git"))) {
+            git clone --filter=blob:none https://github.com/livekit/client-sdk-rust.git $sdk
+          }
+          git -C $sdk fetch --tags origin
+          git -C $sdk checkout $env:SDK_REF
+          git -C $sdk reset --hard
+          # Undo any gn-args patch left by a previous run so the rewrite below
+          # always starts from pristine upstream text.
+          git -C $sdk checkout -- webrtc-sys/libwebrtc/build_windows.cmd
+          Write-Host "client-sdk-rust at: $(git -C $sdk rev-parse HEAD)"
+
+      - name: Disable H.264 in the gn args
+        shell: pwsh
+        env:
+          WORK_DIR: ${{ inputs.work_dir }}
+          VS_PATH: ${{ steps.vs.outputs.path }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $cmd = Join-Path $env:WORK_DIR "client-sdk-rust\webrtc-sys\libwebrtc\build_windows.cmd"
+          $text = Get-Content $cmd -Raw
+
+          # Upstream hardcodes rtc_use_h264=true and ffmpeg_branding="Chrome".
+          # Flipping rtc_use_h264 to false drops //third_party/ffmpeg and
+          # //third_party/openh264:encoder from the webrtc_h264 target's deps.
+          if ($text -notmatch 'rtc_use_h264=true') {
+            throw "Expected 'rtc_use_h264=true' in build_windows.cmd - upstream script changed, review before proceeding."
+          }
+          $text = $text -replace 'rtc_use_h264=true', 'rtc_use_h264=false'
+
+          # ffmpeg_branding is declared by //third_party/ffmpeg. With ffmpeg out
+          # of the build graph gn would reject it as an unknown build argument,
+          # so remove it rather than retarget it to "Chromium".
+          $text = $text -replace '\s*ffmpeg_branding=\\"Chrome\\"', ''
+          if ($text -match 'ffmpeg_branding') {
+            throw "ffmpeg_branding still present after rewrite - review the substitution."
+          }
+
+          # Upstream pins Enterprise; use whatever edition this runner has.
+          $text = $text -replace '(?m)^set vs2019_install=.*$', "set vs2019_install=$($env:VS_PATH)"
+
+          Set-Content -Path $cmd -Value $text -NoNewline
+          Write-Host "--- effective gn args line ---"
+          Select-String -Path $cmd -Pattern 'is_debug=' | ForEach-Object { $_.Line }
+
+      - name: Build libwebrtc
+        shell: cmd
+        working-directory: ${{ inputs.work_dir }}\client-sdk-rust\webrtc-sys\libwebrtc
+        run: |
+          call build_windows.cmd --arch ${{ inputs.arch }} --profile ${{ inputs.profile }}
+          if errorlevel 1 exit /b 1
+
+      - name: Verify H.264 is absent
+        shell: pwsh
+        env:
+          WORK_DIR: ${{ inputs.work_dir }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $art = Join-Path $env:WORK_DIR "client-sdk-rust\webrtc-sys\libwebrtc\win-${{ inputs.arch }}-${{ inputs.profile }}"
+          if (-not (Test-Path $art)) { throw "Artifact dir not produced: $art" }
+
+          # webrtc-sys scrapes -D flags from the first line of webrtc.ninja and
+          # applies them to its own shim. No -DWEBRTC_USE_H264 here means its
+          # encoder-side guard correctly compiles the OpenH264 adapter out.
+          $ninja = Join-Path $art "webrtc.ninja"
+          if (-not (Test-Path $ninja)) { throw "webrtc.ninja missing from artifact" }
+          $first = (Get-Content $ninja -TotalCount 1)
+          if ($first -match 'WEBRTC_USE_H264') {
+            throw "webrtc.ninja still defines WEBRTC_USE_H264 - H.264 was not disabled."
+          }
+          Write-Host "OK: webrtc.ninja does not define WEBRTC_USE_H264"
+
+          & "$env:GITHUB_WORKSPACE\tools\check-no-video-codecs.ps1" -Binary (Join-Path $art "lib\webrtc.lib")
+
+      - name: Package artifact
+        shell: pwsh
+        env:
+          WORK_DIR: ${{ inputs.work_dir }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $art = Join-Path $env:WORK_DIR "client-sdk-rust\webrtc-sys\libwebrtc\win-${{ inputs.arch }}-${{ inputs.profile }}"
+          New-Item -ItemType Directory -Force -Path "$env:GITHUB_WORKSPACE\artifacts" | Out-Null
+          $zip = "$env:GITHUB_WORKSPACE\artifacts\libwebrtc-win-${{ inputs.arch }}-${{ inputs.profile }}-noh264.zip"
+          if (Test-Path $zip) { Remove-Item $zip -Force }
+          Compress-Archive -Path "$art\*" -DestinationPath $zip -CompressionLevel Optimal
+          Write-Host ("Packaged {0:N0} bytes" -f (Get-Item $zip).Length)
+
+      - name: Upload libwebrtc artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: libwebrtc-win-${{ inputs.arch }}-${{ inputs.profile }}-noh264
+          path: artifacts/libwebrtc-win-${{ inputs.arch }}-${{ inputs.profile }}-noh264.zip
+          retention-days: 90
