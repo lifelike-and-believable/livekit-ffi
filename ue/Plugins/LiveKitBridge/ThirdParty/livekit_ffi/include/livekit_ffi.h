@@ -18,6 +18,11 @@ extern "C" {
  * Error code ranges:
  * - 1xx: Connection/Token errors
  * - 2xx: Data send errors
+ *     202 reliable payload larger than 15 KiB
+ *     203 send failed
+ *     204 not sent: the connection is reconnecting (returned at once, see lk_send_data_ex)
+ *     205 not sent: the send did not finish within the send timeout (lk_set_send_timeout_ms)
+ *     206 called from an FFI callback thread (queue the send to your own thread)
  * - 3xx: Audio publish errors
  * - 4xx: Lifecycle errors
  * - 5xx: Internal errors
@@ -67,6 +72,14 @@ typedef enum {
 } LkConnectionState;
 
 /**
+ * Remote participant presence change (lk_set_participant_callback).
+ */
+typedef enum {
+  LkParticipantJoined = 0,
+  LkParticipantLeft = 1
+} LkParticipantEvent;
+
+/**
  * Log level for diagnostics.
  */
 typedef enum {
@@ -83,12 +96,17 @@ typedef enum {
 
 /**
  * Data callback (original, no label/reliability info).
+ * If both data callbacks are set, only the extended one is called; no packet reaches both.
  * NOTE: Callbacks may be invoked on background threads. Never block internally.
  */
 typedef void (*LkDataCallback)(void* user, const uint8_t* bytes, size_t len);
 
 /**
  * Extended data callback with label and reliability.
+ * - label: the sender's label (topic); "" if the sender gave none. Never NULL.
+ * - reliability: the channel the packet actually arrived on. LkLossy only for packets
+ *   sent unreliably (see lk_set_lossy_unreliable); everything else is LkReliable.
+ * Delivered the same way after lk_connect* and lk_connect*_async.
  * NOTE: Callbacks may be invoked on background threads. Never block internally.
  */
 typedef void (*LkDataCallbackEx)(void* user, const char* label, LkReliability reliability, const uint8_t* bytes, size_t len);
@@ -123,6 +141,20 @@ typedef void (*LkAudioFormatChangeCallback)(void* user, int32_t sample_rate, int
  * NOTE: Callbacks may be invoked on background threads. Never block internally.
  */
 typedef void (*LkConnectionCallback)(void* user, LkConnectionState state, int32_t reason_code, const char* message);
+
+/**
+ * Remote participant joined / left callback.
+ * - identity: participant identity (never NULL)
+ * - name: participant display name; may be "" (never NULL)
+ * Both strings are valid only for the duration of the call; copy them if needed.
+ * Only remote participants are reported, never the local one. Participants already in
+ * the room when the connection is established are each reported as LkParticipantJoined
+ * right after LkConnConnected. Each identity alternates strictly Joined / Left.
+ * During a full reconnect the SDK drops and re-adds every remote participant, so each
+ * one is reported Left and then Joined again.
+ * NOTE: Callbacks may be invoked on background threads. Never block internally.
+ */
+typedef void (*LkParticipantCallback)(void* user, LkParticipantEvent event, const char* identity, const char* name);
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Diagnostic Structures
@@ -199,6 +231,13 @@ LkResult lk_set_audio_format_change_callback(LkClientHandle*, LkAudioFormatChang
 LkResult lk_set_connection_callback(LkClientHandle*, LkConnectionCallback cb, void* user);
 
 /**
+ * Set remote participant joined/left callback.
+ * Set it before connecting: participants already in the room are announced once,
+ * immediately after the connection is established.
+ */
+LkResult lk_set_participant_callback(LkClientHandle*, LkParticipantCallback cb, void* user);
+
+/**
  * Connect to LiveKit room (defaults to LkRoleBoth).
  */
 LkResult lk_connect(LkClientHandle*, const char* url, const char* token);
@@ -222,7 +261,10 @@ LkResult lk_connect_with_role_async(LkClientHandle*, const char* url, const char
 
 /**
  * Disconnect from LiveKit room.
- * Blocks until disconnect is complete and callbacks are quiesced.
+ * Blocks until disconnect is complete and callbacks are quiesced. If a room was
+ * connected, the connection callback receives LkConnDisconnected (message
+ * "ClientInitiated") on the calling thread before this returns; no callback fires after.
+ * Must not be called from inside an FFI callback (returns code 403).
  */
 LkResult lk_disconnect(LkClientHandle*);
 
@@ -317,9 +359,8 @@ LkResult lk_audio_track_publish_pcm_i16(
 // ═══════════════════════════════════════════════════════════════════════════
 
 /**
- * Send data (original API).
+ * Send data (original API). Same as lk_send_data_ex(..., ordered = 1, label = NULL).
  * Size guidance: lossy ≤ ~1300 bytes, reliable ≤ ~15 KiB.
- * Exceeding these limits will result in an error.
  */
 LkResult lk_send_data(
   LkClientHandle*,
@@ -329,10 +370,19 @@ LkResult lk_send_data(
 
 /**
  * Send data with extended options.
- * - ordered: 1 to preserve order, 0 for unordered (default 1)
- * - label: optional label for the data channel (NULL uses default)
+ * - ordered: has no effect; it is kept for ABI compatibility. Ordering follows from
+ *   the transport (see "Data delivery contract" below).
+ * - label: optional label (topic) delivered to receivers (NULL uses the default label)
  *
- * Size guidance: lossy ≤ ~1300 bytes, reliable ≤ ~15 KiB.
+ * Size guidance: lossy ≤ ~1300 bytes, reliable ≤ ~15 KiB. A lossy payload over
+ * ~1300 bytes is sent as reliable data instead; a reliable payload over 15 KiB
+ * returns 202.
+ *
+ * Blocking: the call waits until the data is handed to the transport, bounded by the
+ * send timeout (lk_set_send_timeout_ms, default 1000 ms, then code 205). It never
+ * holds up other FFI calls on the client. While the connection is reconnecting it
+ * returns 204 at once without sending; drop or queue the data and resend after
+ * LkConnConnected. Must not be called from inside an FFI callback (returns 206).
  */
 LkResult lk_send_data_ex(
   LkClientHandle*,
@@ -347,6 +397,55 @@ LkResult lk_send_data_ex(
  * If NULL, uses built-in defaults.
  */
 LkResult lk_set_default_data_labels(LkClientHandle*, const char* reliable_label, const char* lossy_label);
+
+/**
+ * Choose how LkLossy data is sent.
+ * - enable = 0 (default): LkLossy data goes out like LkReliable data, as a byte stream
+ *   on the reliable, ordered channel. Every receiver version gets it.
+ * - enable = 1: LkLossy data is sent as unreliable, unordered data packets with no
+ *   retransmission, so a lost packet is never waited for. Receivers see it with
+ *   reliability LkLossy. Receivers built from livekit_ffi older than 0.4 do not
+ *   deliver these packets, so enable it only when every receiver is 0.4 or newer.
+ */
+LkResult lk_set_lossy_unreliable(LkClientHandle*, int32_t enable);
+
+/**
+ * Bound how long lk_send_data / lk_send_data_ex may block, in milliseconds.
+ * Default 1000. 0 means no bound (the pre-0.4 behaviour). On timeout the send returns
+ * 205 and the data must be treated as not delivered.
+ */
+LkResult lk_set_send_timeout_ms(LkClientHandle*, int32_t timeout_ms);
+
+// ───────────────────────────────────────────────────────────────────────────
+// Data delivery contract
+// ───────────────────────────────────────────────────────────────────────────
+//
+// Reliable data (LkReliable, and LkLossy unless lk_set_lossy_unreliable is on):
+// - Each send is one byte stream on the publisher's reliable, ordered data channel.
+// - While the session stays up, data from one sender reaches each receiver once, in
+//   send order, with nothing lost. Receivers read streams in arrival order and
+//   deliver each payload whole; a stream that arrives incomplete (or does not finish
+//   within 2 s) is dropped, never delivered truncated.
+// - A send that returns 204 or 205 was not delivered. 0 means the data was handed to
+//   the transport, not that a receiver has it.
+//
+// Unreliable data (LkLossy with lk_set_lossy_unreliable(client, 1)):
+// - Single packets on the lossy channel: unordered, no retransmission. Any packet
+//   may be lost or reordered.
+//
+// Reconnects. The connection callback reports LkConnReconnecting, then
+// LkConnConnected when the session is back (or LkConnDisconnected if it is not).
+// - Sends during LkConnReconnecting return 204 and are not sent.
+// - Data in flight when the reconnect started is not reported to either side and may
+//   be lost. The SDK can either resume the existing session or replace it (a full
+//   reconnect); the FFI cannot tell these apart, and across a full reconnect in-flight
+//   data is lost.
+// - So treat every LkConnReconnecting -> LkConnConnected as a possible gap: a sender
+//   whose data depends on earlier data (e.g. deltas) should send a full state after
+//   LkConnConnected. A full reconnect also reports every remote participant Left and
+//   then Joined (lk_set_participant_callback), the same signal as a new peer joining.
+//
+// ───────────────────────────────────────────────────────────────────────────
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Reconnection and Token Management
@@ -404,6 +503,9 @@ LkResult lk_get_data_stats(LkClientHandle*, LkDataStats* out_stats);
 //
 // - All callbacks may be invoked on background threads.
 // - Callbacks must not block or perform long-running operations.
+// - Do not call lk_* functions from inside a callback. Queue the work to your own
+//   thread instead (e.g. send a full sync from your game thread after a Joined).
+//   lk_send_data* and lk_disconnect detect this and return 206 / 403.
 // - API calls are thread-safe and may be called from any thread.
 // - After lk_disconnect() or lk_client_destroy() returns, no further callbacks
 //   will be invoked.
