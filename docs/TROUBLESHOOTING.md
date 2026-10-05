@@ -364,8 +364,11 @@ lk_set_audio_output_format(client, 48000, 1);  // Match publish rate
 #### 1. Size Exceeded
 
 **Error codes:**
-- 201: Lossy data too large (> 1300 bytes)
 - 202: Reliable data too large (> 15 KiB)
+- 204: Not sent because the connection is reconnecting
+- 205: Not sent because the send timeout elapsed (`lk_set_send_timeout_ms`)
+
+(`LkLossy` payloads over 1300 bytes do not fail; they are sent as reliable data.)
 
 **Fix:**
 ```cpp

@@ -415,10 +415,12 @@ Network
 - Error code 202 if exceeded
 
 **Lossy Channel:**
-- Built on SCTP with partial reliability
+- Used for `LkLossy` only when the sender opts in with `lk_set_lossy_unreliable`;
+  by default `LkLossy` data goes out as a reliable byte stream
+- Built on SCTP with partial reliability (unordered, no retransmits)
 - No delivery or ordering guarantees
-- Max recommended size: ~1300 bytes (to fit in single packet)
-- Error code 201 if exceeded
+- Max recommended size: ~1300 bytes (to fit in single packet); larger
+  `LkLossy` payloads are sent as reliable data instead
 
 ### Data Channel State
 
