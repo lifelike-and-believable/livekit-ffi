@@ -4,11 +4,11 @@
 //! Underruns are zero-padded; overflow drops tail to avoid stalling UE audio.
 
 use std::borrow::Cow;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ffi::{CStr, CString};
 use std::os::raw::{c_char, c_int, c_void, c_float};
 use std::ptr;
-use std::sync::atomic::{AtomicI32, AtomicI64, Ordering};
+use std::sync::atomic::{AtomicI32, AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use anyhow::Result;
@@ -25,7 +25,7 @@ use livekit::options::TrackPublishOptions;
 use livekit::prelude::*;
 use livekit::RoomOptions;
 use livekit::{ByteStreamWriter, StreamByteOptions, StreamWriter};
-use livekit::RoomEvent;
+use livekit::{DataPacket, DataPacketKind, RoomEvent};
 // use livekit::data_stream::ByteStreamReader; // not currently used
 use livekit::StreamReader;
 use livekit::webrtc::audio_source::{native::NativeAudioSource, AudioSourceOptions, RtcAudioSource};
@@ -107,6 +107,13 @@ pub enum LkConnectionState {
     Reconnecting = 2,
     Disconnected = 3,
     Failed = 4,
+}
+
+#[repr(C)]
+#[derive(Copy, Clone, Debug)]
+pub enum LkParticipantEvent {
+    Joined = 0,
+    Left = 1,
 }
 
 #[repr(C)]
@@ -292,6 +299,54 @@ impl Default for DataStatsCounters {
     }
 }
 
+/// Fences user callbacks off from lk_disconnect / lk_client_destroy.
+///
+/// Every event loop and audio task records the generation it was started under and
+/// delivers callbacks through `run`. `retire` bumps the generation and then waits for
+/// any callback in flight, so once it returns no callback from an earlier session can
+/// start. Callbacks run without the client lock held, which lets a callback that
+/// queues work to another thread do so without deadlocking against FFI calls.
+struct CallbackGate {
+    generation: AtomicU64,
+    dispatch: Mutex<()>,
+}
+
+impl CallbackGate {
+    fn new() -> Self {
+        Self { generation: AtomicU64::new(0), dispatch: Mutex::new(()) }
+    }
+
+    fn current(&self) -> u64 {
+        self.generation.load(Ordering::SeqCst)
+    }
+
+    fn run<F: FnOnce()>(&self, generation: u64, f: F) {
+        let _d = self.dispatch.lock().unwrap_or_else(|e| e.into_inner());
+        if self.generation.load(Ordering::SeqCst) == generation {
+            f();
+        }
+    }
+
+    fn retire(&self) {
+        self.generation.fetch_add(1, Ordering::SeqCst);
+        drop(self.dispatch.lock().unwrap_or_else(|e| e.into_inner()));
+    }
+}
+
+/// Copies a callback out of the client state so it can be invoked after the lock is released.
+fn cb_copy<F: Copy>(slot: &Option<(F, UserPtr)>) -> Option<(F, *mut c_void)> {
+    slot.as_ref().map(|(f, u)| (*f, u.0))
+}
+
+/// Upper bound for reading one incoming byte stream. The SDK never closes a stream whose
+/// trailer is lost (e.g. the sender's session was replaced mid-stream), and streams are
+/// read in order on the event loop, so without a bound one lost trailer would stall every
+/// later event.
+const STREAM_READ_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Default bound for lk_send_data / lk_send_data_ex (see lk_set_send_timeout_ms).
+const DEFAULT_SEND_TIMEOUT_MS: u64 = 1_000;
+
 struct ClientState {
     room: Option<Room>,
     audio_tracks: HashMap<u64, AudioPipeline>,
@@ -306,6 +361,8 @@ struct ClientState {
     audio_cb_ex: Option<(extern "C" fn(*mut c_void, *const i16, usize, c_int, c_int, *const c_char, *const c_char), UserPtr)>,
     audio_format_change_cb: Option<(extern "C" fn(*mut c_void, c_int, c_int), UserPtr)>,
     connection_cb: Option<(extern "C" fn(*mut c_void, LkConnectionState, c_int, *const c_char), UserPtr)>,
+    participant_cb: Option<(extern "C" fn(*mut c_void, LkParticipantEvent, *const c_char, *const c_char), UserPtr)>,
+    gate: Arc<CallbackGate>,
     
     // Configuration
     role: LkRole,
@@ -313,6 +370,8 @@ struct ClientState {
     audio_output_format: AudioOutputFormat,
     data_labels: DataLabels,
     log_level: LkLogLevel,
+    lossy_unreliable: bool,
+    send_timeout_ms: u64,
     
     // Statistics
     data_stats: Arc<DataStatsCounters>,
@@ -348,11 +407,15 @@ pub extern "C" fn lk_client_create() -> *mut LkClientHandle {
         audio_cb_ex: None,
         audio_format_change_cb: None,
         connection_cb: None,
+        participant_cb: None,
+        gate: Arc::new(CallbackGate::new()),
         role: LkRole::Both,
         audio_publish_opts: AudioPublishOptions::default(),
         audio_output_format: AudioOutputFormat::default(),
         data_labels: DataLabels::default(),
         log_level: LkLogLevel::Error,
+        lossy_unreliable: false,
+        send_timeout_ms: DEFAULT_SEND_TIMEOUT_MS,
         data_stats: Arc::new(DataStatsCounters::default()),
     };
     let boxed = Box::new(Client(Arc::new(Mutex::new(state))));
@@ -364,7 +427,36 @@ pub extern "C" fn lk_client_destroy(client: *mut LkClientHandle) {
     if client.is_null() {
         return;
     }
-    unsafe { drop(Box::from_raw(client as *mut Client)); }
+    let boxed = unsafe { Box::from_raw(client as *mut Client) };
+    // Event loops and audio tasks hold their own reference to the state, so retire them
+    // explicitly: the header promises no callbacks once this returns.
+    let gate = match boxed.0.lock() {
+        Ok(g) => g.gate.clone(),
+        Err(e) => e.into_inner().gate.clone(),
+    };
+    if tokio::runtime::Handle::try_current().is_ok() {
+        // Called from inside a callback, which holds the dispatch lock on this thread:
+        // waiting for it would self-deadlock, so only retire the generation.
+        gate.generation.fetch_add(1, Ordering::SeqCst);
+    } else {
+        gate.retire();
+    }
+    let (room, rt) = match boxed.0.lock() {
+        Ok(mut g) => {
+            g.audio_tracks.clear();
+            (g.room.take(), g.rt.clone())
+        }
+        Err(_) => (None, runtime()),
+    };
+    if let Some(room) = room {
+        // block_on would panic on a runtime thread; there the room is just dropped.
+        if tokio::runtime::Handle::try_current().is_err() {
+            rt.block_on(async move {
+                let _ = room.close().await;
+            });
+        }
+    }
+    drop(boxed);
 }
 
 #[no_mangle]
@@ -453,7 +545,47 @@ pub extern "C" fn lk_set_connection_callback(
     ok()
 }
 
+#[no_mangle]
+pub extern "C" fn lk_set_participant_callback(
+    client: *mut LkClientHandle,
+    cb: Option<extern "C" fn(user: *mut c_void, event: LkParticipantEvent, identity: *const c_char, name: *const c_char)>,
+    user: *mut c_void,
+) -> LkResult {
+    if client.is_null() { return err(1, "client null"); }
+    let c = unsafe { &*(client as *const Client) };
+    let mut g = c.0.lock().unwrap();
+    g.participant_cb = cb.map(|f| (f, UserPtr(user)));
+    ok()
+}
+
 // --------- Configuration Functions ---------
+
+#[no_mangle]
+pub extern "C" fn lk_set_lossy_unreliable(
+    client: *mut LkClientHandle,
+    enable: c_int,
+) -> LkResult {
+    if client.is_null() { return err(1, "client null"); }
+    let c = unsafe { &*(client as *const Client) };
+    let mut g = c.0.lock().unwrap();
+    g.lossy_unreliable = enable != 0;
+    lk_log!(g, LkLogLevel::Debug, "Lossy transport: {}", if g.lossy_unreliable { "unreliable data packets" } else { "reliable byte streams" });
+    ok()
+}
+
+#[no_mangle]
+pub extern "C" fn lk_set_send_timeout_ms(
+    client: *mut LkClientHandle,
+    timeout_ms: c_int,
+) -> LkResult {
+    if client.is_null() { return err(1, "client null"); }
+    if timeout_ms < 0 { return err(5, "timeout_ms must be >= 0"); }
+    let c = unsafe { &*(client as *const Client) };
+    let mut g = c.0.lock().unwrap();
+    g.send_timeout_ms = timeout_ms as u64;
+    lk_log!(g, LkLogLevel::Debug, "Send timeout set to {} ms (0 = unbounded)", timeout_ms);
+    ok()
+}
 
 #[no_mangle]
 pub extern "C" fn lk_set_audio_publish_options(
@@ -571,6 +703,213 @@ pub extern "C" fn lk_set_log_level(
     ok()
 }
 
+// --------- Event loop (shared by sync and async connect) ---------
+
+/// Everything a session's event loop and its audio tasks need to deliver callbacks.
+/// Callbacks are copied out under the client lock and invoked after it is released,
+/// through the gate, so lk_disconnect can retire them.
+#[derive(Clone)]
+struct EventCtx {
+    client: Arc<Mutex<ClientState>>,
+    gate: Arc<CallbackGate>,
+    generation: u64,
+}
+
+impl EventCtx {
+    fn new(client: &Arc<Mutex<ClientState>>, gate: Arc<CallbackGate>, generation: u64) -> Self {
+        Self { client: client.clone(), gate, generation }
+    }
+
+    fn emit_data(&self, label: &str, reliability: LkReliability, bytes: &[u8]) {
+        let (ex, plain) = match self.client.lock() {
+            Ok(g) => (cb_copy(&g.data_cb_ex), cb_copy(&g.data_cb)),
+            Err(_) => return,
+        };
+        let label_c = CString::new(label).unwrap_or_default();
+        self.gate.run(self.generation, || {
+            // The extended callback wins when both are set; no packet reaches both.
+            if let Some((cb, user)) = ex {
+                cb(user, label_c.as_ptr(), reliability, bytes.as_ptr(), bytes.len());
+            } else if let Some((cb, user)) = plain {
+                cb(user, bytes.as_ptr(), bytes.len());
+            }
+        });
+    }
+
+    fn emit_connection(&self, state: LkConnectionState, reason_code: c_int, message: Option<&str>) {
+        let cb = match self.client.lock() {
+            Ok(g) => cb_copy(&g.connection_cb),
+            Err(_) => return,
+        };
+        let Some((cb, user)) = cb else { return; };
+        let msg = message.map(|m| CString::new(m).unwrap_or_default());
+        self.gate.run(self.generation, || {
+            cb(user, state, reason_code, msg.as_ref().map_or(ptr::null(), |m| m.as_ptr()));
+        });
+    }
+
+    fn emit_participant(&self, event: LkParticipantEvent, identity: &str, name: &str) {
+        let cb = match self.client.lock() {
+            Ok(g) => cb_copy(&g.participant_cb),
+            Err(_) => return,
+        };
+        let Some((cb, user)) = cb else { return; };
+        let identity_c = CString::new(identity).unwrap_or_default();
+        let name_c = CString::new(name).unwrap_or_default();
+        self.gate.run(self.generation, || {
+            cb(user, event, identity_c.as_ptr(), name_c.as_ptr());
+        });
+    }
+
+    fn emit_audio(&self, pcm: &[i16], frames_per_channel: usize, channels: c_int, sample_rate: c_int, participant: &CStr, track: &CStr) {
+        let (ex, plain) = match self.client.lock() {
+            Ok(g) => (cb_copy(&g.audio_cb_ex), cb_copy(&g.audio_cb)),
+            Err(_) => return,
+        };
+        self.gate.run(self.generation, || {
+            if let Some((cb, user)) = ex {
+                cb(user, pcm.as_ptr(), frames_per_channel, channels, sample_rate, participant.as_ptr(), track.as_ptr());
+            } else if let Some((cb, user)) = plain {
+                cb(user, pcm.as_ptr(), frames_per_channel, channels, sample_rate);
+            }
+        });
+    }
+}
+
+fn to_lk_state(state: livekit::ConnectionState) -> LkConnectionState {
+    match state {
+        livekit::ConnectionState::Disconnected => LkConnectionState::Disconnected,
+        livekit::ConnectionState::Connected => LkConnectionState::Connected,
+        livekit::ConnectionState::Reconnecting => LkConnectionState::Reconnecting,
+    }
+}
+
+/// Remote participants already in the room. Room::connect creates them from the join
+/// response without dispatching ParticipantConnected, so the loop announces them itself.
+fn present_participants(room: &Room) -> Vec<(String, String)> {
+    room.remote_participants()
+        .values()
+        .map(|p| (p.identity().to_string(), p.name()))
+        .collect()
+}
+
+fn spawn_audio_forwarder(ctx: EventCtx, audio: RemoteAudioTrack, participant_identity: String, track_name: String) {
+    let (sample_rate, channels) = match ctx.client.lock() {
+        Ok(g) => (g.audio_output_format.sample_rate, g.audio_output_format.channels),
+        Err(_) => (48_000, 1),
+    };
+    let rtc = audio.rtc_track();
+    tokio::spawn(async move {
+        let mut stream = NativeAudioStream::new(rtc, sample_rate, channels);
+        let participant_c = CString::new(participant_identity).unwrap_or_default();
+        let track_c = CString::new(track_name).unwrap_or_default();
+        let mut logged_first = false;
+        while let Some(frame) = stream.next().await {
+            if ctx.gate.current() != ctx.generation {
+                break;
+            }
+            ctx.emit_audio(
+                frame.data.as_ref(),
+                frame.samples_per_channel as usize,
+                frame.num_channels as c_int,
+                frame.sample_rate as c_int,
+                &participant_c,
+                &track_c,
+            );
+            if !logged_first {
+                lk_log_arc!(ctx.client, LkLogLevel::Debug, "First remote audio frame: sr={}Hz, ch={}, fpc={}", frame.sample_rate, frame.num_channels, frame.samples_per_channel);
+                logged_first = true;
+            }
+        }
+    });
+}
+
+/// The one event loop both connect paths use, so they cannot drift apart again (#13).
+fn spawn_event_loop(
+    rt: &Runtime,
+    ctx: EventCtx,
+    mut events: tokio::sync::mpsc::UnboundedReceiver<RoomEvent>,
+    initial_participants: Vec<(String, String)>,
+) {
+    rt.spawn(async move {
+        // Identities announced as joined. Joined/Left fire only on a real change, so a
+        // participant who shows up both in the connect-time snapshot and as a queued
+        // ParticipantConnected is announced once.
+        let mut present: HashSet<String> = HashSet::new();
+        for (identity, name) in initial_participants {
+            if present.insert(identity.clone()) {
+                lk_log_arc!(ctx.client, LkLogLevel::Info, "Participant present at connect: '{}'", identity);
+                ctx.emit_participant(LkParticipantEvent::Joined, &identity, &name);
+            }
+        }
+
+        while let Some(ev) = events.recv().await {
+            if ctx.gate.current() != ctx.generation {
+                break;
+            }
+            match ev {
+                RoomEvent::ParticipantConnected(participant) => {
+                    let identity = participant.identity().to_string();
+                    if present.insert(identity.clone()) {
+                        lk_log_arc!(ctx.client, LkLogLevel::Info, "Participant joined: '{}'", identity);
+                        ctx.emit_participant(LkParticipantEvent::Joined, &identity, &participant.name());
+                    }
+                }
+                RoomEvent::ParticipantDisconnected(participant) => {
+                    let identity = participant.identity().to_string();
+                    if present.remove(&identity) {
+                        lk_log_arc!(ctx.client, LkLogLevel::Info, "Participant left: '{}'", identity);
+                        ctx.emit_participant(LkParticipantEvent::Left, &identity, &participant.name());
+                    }
+                }
+                RoomEvent::ByteStreamOpened { reader, topic, participant_identity } => {
+                    let Some(reader) = reader.take() else { continue; };
+                    // Read inline: callbacks then arrive in the order the streams were opened.
+                    match tokio::time::timeout(STREAM_READ_TIMEOUT, reader.read_all()).await {
+                        Ok(Ok(content)) => {
+                            lk_log_arc!(ctx.client, LkLogLevel::Debug, "ByteStreamOpened: received {} bytes on topic '{}' from '{}'", content.len(), topic, participant_identity);
+                            // Byte streams always travel on the reliable, ordered channel.
+                            ctx.emit_data(&topic, LkReliability::Reliable, &content);
+                        }
+                        Ok(Err(e)) => {
+                            lk_log_arc!(ctx.client, LkLogLevel::Warn, "Dropped incomplete byte stream on topic '{}' from '{}': {}", topic, participant_identity, e);
+                        }
+                        Err(_) => {
+                            lk_log_arc!(ctx.client, LkLogLevel::Warn, "Dropped byte stream on topic '{}' from '{}': not completed within {:?}", topic, participant_identity, STREAM_READ_TIMEOUT);
+                        }
+                    }
+                }
+                RoomEvent::DataReceived { payload, topic, kind, participant: _ } => {
+                    let reliability = match kind {
+                        DataPacketKind::Lossy => LkReliability::Lossy,
+                        DataPacketKind::Reliable => LkReliability::Reliable,
+                    };
+                    let label = topic.as_deref().unwrap_or("");
+                    lk_log_arc!(ctx.client, LkLogLevel::Debug, "DataReceived: {} bytes, topic '{}', {:?}", payload.len(), label, kind);
+                    ctx.emit_data(label, reliability, &payload);
+                }
+                RoomEvent::Disconnected { reason } => {
+                    lk_log_arc!(ctx.client, LkLogLevel::Info, "Disconnected event: reason={:?}", reason);
+                    ctx.emit_connection(LkConnectionState::Disconnected, 0, Some(&format!("{:?}", reason)));
+                }
+                RoomEvent::ConnectionStateChanged(state) => {
+                    lk_log_arc!(ctx.client, LkLogLevel::Debug, "ConnectionStateChanged: {:?}", state);
+                    ctx.emit_connection(to_lk_state(state), 0, None);
+                }
+                RoomEvent::TrackSubscribed { track, publication, participant } => {
+                    if let RemoteTrack::Audio(audio) = track {
+                        lk_log_arc!(ctx.client, LkLogLevel::Info, "TrackSubscribed audio: name='{}', sid='{}', participant='{}'", publication.name(), publication.sid(), participant.identity());
+                        spawn_audio_forwarder(ctx.clone(), audio, participant.identity().to_string(), publication.name().to_string());
+                    }
+                }
+                other => {
+                    lk_log_arc!(ctx.client, LkLogLevel::Trace, "Event: {:?}", other);
+                }
+            }
+        }
+    });
+}
+
 // --------- Connection Functions ---------
 
 #[no_mangle]
@@ -617,131 +956,19 @@ pub extern "C" fn lk_connect_with_role(
     });
 
     match res {
-        Ok((room, mut events)) => {
+        Ok((room, events)) => {
             g.role = role_copy;
-            let client_arc = c.0.clone();
             lk_log!(g, LkLogLevel::Info, "Connected. role={:?} auto_subscribe={}", role_copy, !matches!(role_copy, LkRole::Publisher));
-            
+
             // Notify connection established
             if let Some((cb, user)) = g.connection_cb.as_ref() {
                 cb(user.0, LkConnectionState::Connected, 0, ptr::null());
             }
-            
-            // Spawn event processor to handle incoming data/audio
-            g.rt.spawn(async move {
-                while let Some(ev) = events.recv().await {
-                    match ev {
-                        RoomEvent::ByteStreamOpened { reader, topic, participant_identity: _ } => {
-                            let Some(reader) = reader.take() else { continue; };
-                            // Read all bytes, then invoke callback if set
-                            let bytes_res = reader.read_all().await;
-                            if let Ok(content) = bytes_res {
-                                // Copy to Vec to ensure stable backing memory for callback
-                                let buf: Vec<u8> = content.to_vec();
-                                lk_log_arc!(client_arc, LkLogLevel::Debug, "ByteStreamOpened: received {} bytes on topic '{}'", buf.len(), topic);
-                                let guard_opt = client_arc.lock().ok();
-                                if let Some(guard) = guard_opt {
-                                    // Invoke extended callback with label if set, otherwise fall back to basic callback
-                                    if let Some((cb, user)) = guard.data_cb_ex.as_ref() {
-                                        // Create C string for the topic label
-                                        let topic_cstr = std::ffi::CString::new(topic.as_str()).unwrap_or_else(|_| std::ffi::CString::new("").unwrap());
-                                        // SAFETY: We call user-provided callback with stable C string and buffer
-                                        // Note: Reliability defaults to Reliable since that's the safe default and
-                                        // LiveKit's ByteStreamOpened event doesn't provide explicit reliability info
-                                        cb(user.0, topic_cstr.as_ptr(), LkReliability::Reliable, buf.as_ptr(), buf.len());
-                                    } else if let Some((cb, user)) = guard.data_cb.as_ref() {
-                                        // SAFETY: We call user-provided callback synchronously with stable buffer
-                                        cb(user.0, buf.as_ptr(), buf.len());
-                                    }
-                                }
-                                drop(buf);
-                            }
-                        }
-                        RoomEvent::Disconnected { reason } => {
-                            lk_log_arc!(client_arc, LkLogLevel::Info, "Disconnected event: reason={:?}", reason);
-                            let guard_opt = client_arc.lock().ok();
-                            if let Some(guard) = guard_opt {
-                                if let Some((cb, user)) = guard.connection_cb.as_ref() {
-                                    let msg = CString::new(format!("{:?}", reason)).unwrap_or_default();
-                                    cb(user.0, LkConnectionState::Disconnected, 0, msg.as_ptr());
-                                }
-                            }
-                        }
-                        RoomEvent::ConnectionStateChanged(state) => {
-                            lk_log_arc!(client_arc, LkLogLevel::Debug, "ConnectionStateChanged: {:?}", state);
-                            let guard_opt = client_arc.lock().ok();
-                            if let Some(guard) = guard_opt {
-                                if let Some((cb, user)) = guard.connection_cb.as_ref() {
-                                    let lk_state = match state {
-                                        livekit::ConnectionState::Disconnected => LkConnectionState::Disconnected,
-                                        livekit::ConnectionState::Connected => LkConnectionState::Connected,
-                                        livekit::ConnectionState::Reconnecting => LkConnectionState::Reconnecting,
-                                    };
-                                    cb(user.0, lk_state, 0, ptr::null());
-                                }
-                            }
-                        }
-                        RoomEvent::TrackSubscribed { track, publication, participant } => {
-                            // Remote audio subscribed - set up a NativeAudioStream and forward frames to audio callback
-                            if let RemoteTrack::Audio(audio) = track {
-                                lk_log_arc!(client_arc, LkLogLevel::Info, "TrackSubscribed audio: name='{}', sid='{}', participant='{}'", publication.name(), publication.sid(), participant.identity());
-                                // Extract underlying RTC track to build a stream reader
-                                let rtc = audio.rtc_track();
-                                let client_arc2 = client_arc.clone();
-                                let track_name = publication.name().to_string();
-                                let participant_name = participant.identity().to_string();
 
-                                // Use configured audio output format
-                                let (sample_rate, channels) = {
-                                    let guard_opt = client_arc.lock().ok();
-                                    if let Some(guard) = guard_opt {
-                                        (guard.audio_output_format.sample_rate as u32, guard.audio_output_format.channels as u32)
-                                    } else {
-                                        (48_000u32, 1u32)
-                                    }
-                                };
-
-                                // Spawn a task to poll audio frames and invoke the user callback synchronously per frame
-                                tokio::spawn(async move {
-                                    let mut stream = NativeAudioStream::new(rtc, sample_rate as i32, channels as i32);
-                                    let mut logged_first = false;
-                                    while let Some(frame) = stream.next().await {
-                                        // Copy to Vec to ensure stable memory for callback
-                                        let buf: Vec<i16> = frame.data.as_ref().to_vec();
-
-                                        if let Ok(guard) = client_arc2.lock() {
-                                            // Try extended callback first, fall back to standard callback
-                                            if let Some((cb, user)) = guard.audio_cb_ex.as_ref() {
-                                                let frames_per_channel = frame.samples_per_channel as usize;
-                                                let ch = frame.num_channels as c_int;
-                                                let sr = frame.sample_rate as c_int;
-                                                let track_name_cstr = CString::new(track_name.as_str()).unwrap_or_default();
-                                                let participant_name_cstr = CString::new(participant_name.as_str()).unwrap_or_default();
-                                                cb(user.0, buf.as_ptr(), frames_per_channel, ch, sr, participant_name_cstr.as_ptr(), track_name_cstr.as_ptr());
-                                            } else if let Some((cb, user)) = guard.audio_cb.as_ref() {
-                                                let frames_per_channel = frame.samples_per_channel as usize;
-                                                let ch = frame.num_channels as c_int;
-                                                let sr = frame.sample_rate as c_int;
-                                                cb(user.0, buf.as_ptr(), frames_per_channel, ch, sr);
-                                            }
-                                        }
-                                        // buf drops after callback returns
-
-                                        if !logged_first {
-                                            lk_log_arc!(client_arc2, LkLogLevel::Debug, "First remote audio frame: sr={}Hz, ch={}, fpc={}", frame.sample_rate, frame.num_channels, frame.samples_per_channel);
-                                            logged_first = true;
-                                        }
-                                    }
-                                });
-                            }
-                        }
-                        other => {
-                            // Trace level catch-all
-                            lk_log_arc!(client_arc, LkLogLevel::Trace, "Event: {:?}", other);
-                        }
-                    }
-                }
-            });
+            // The loop starts with the participants already present; it blocks on the
+            // client lock until this call returns, so they are reported after Connected.
+            let ctx = EventCtx::new(&c.0, g.gate.clone(), g.gate.current());
+            spawn_event_loop(&rt, ctx, events, present_participants(&room));
             g.room = Some(room);
             ok()
         }
@@ -783,7 +1010,11 @@ pub extern "C" fn lk_connect_with_role_async(
     let client_arc = c.0.clone();
 
     // Early-out if already connected
-    if let Ok(g) = client_arc.lock() {
+    let ctx = {
+        let g = match client_arc.lock() {
+            Ok(g) => g,
+            Err(_) => return err(5, "client state poisoned"),
+        };
         if g.room.is_some() {
             return err(104, "already connected");
         }
@@ -791,132 +1022,84 @@ pub extern "C" fn lk_connect_with_role_async(
         if let Some((cb, user)) = g.connection_cb.as_ref() {
             cb(user.0, LkConnectionState::Connecting, 0, ptr::null());
         }
-    }
+        // A disconnect issued before the attempt completes retires this generation.
+        EventCtx::new(&client_arc, g.gate.clone(), g.gate.current())
+    };
 
     // Spawn the connection attempt without blocking the caller
     let rt = runtime();
+    let rt_loop = rt.clone();
     rt.spawn(async move {
         let mut opts = RoomOptions::default();
         if matches!(role, LkRole::Publisher) { opts.auto_subscribe = false; }
-        let res = Room::connect(&url, &token, opts).await;
-        match res {
-            Ok((room, mut events)) => {
-                // On success, update state and notify
-                if let Ok(mut g) = client_arc.lock() {
-                    g.role = role;
-                    g.room = Some(room);
-                    if let Some((cb, user)) = g.connection_cb.as_ref() {
-                        cb(user.0, LkConnectionState::Connected, 0, ptr::null());
+        match Room::connect(&url, &token, opts).await {
+            Ok((room, events)) => {
+                let initial = present_participants(&room);
+                // Install the room unless lk_disconnect ran (or another connect won) meanwhile.
+                let stale_room = match ctx.client.lock() {
+                    Ok(mut g) if g.gate.current() == ctx.generation && g.room.is_none() => {
+                        g.role = role;
+                        g.room = Some(room);
+                        lk_log!(g, LkLogLevel::Info, "Connected (async). role={:?} auto_subscribe={}", role, !matches!(role, LkRole::Publisher));
+                        None
                     }
+                    _ => Some(room),
+                };
+                if let Some(room) = stale_room {
+                    lk_log_arc!(ctx.client, LkLogLevel::Info, "Async connect completed after disconnect; closing the new session");
+                    let _ = room.close().await;
+                    return;
                 }
-
-                // Spawn event processing loop (mirrors sync connect)
-                let client_arc2 = client_arc.clone();
-                runtime().spawn(async move {
-                    while let Some(ev) = events.recv().await {
-                        match ev {
-                            RoomEvent::ByteStreamOpened { reader, topic: _, participant_identity: _ } => {
-                                let Some(reader) = reader.take() else { continue; };
-                                if let Ok(content) = reader.read_all().await {
-                                    let buf: Vec<u8> = content.to_vec();
-                                    if let Ok(guard) = client_arc2.lock() {
-                                        lk_log!(guard, LkLogLevel::Debug, "ByteStreamOpened: received {} bytes", buf.len());
-                                        if let Some((cb, user)) = guard.data_cb.as_ref() { cb(user.0, buf.as_ptr(), buf.len()); }
-                                    }
-                                }
-                            }
-                            RoomEvent::Disconnected { reason } => {
-                                if let Ok(guard) = client_arc2.lock() {
-                                    if let Some((cb, user)) = guard.connection_cb.as_ref() {
-                                        let msg = CString::new(format!("{:?}", reason)).unwrap_or_default();
-                                        cb(user.0, LkConnectionState::Disconnected, 0, msg.as_ptr());
-                                    }
-                                }
-                            }
-                            RoomEvent::ConnectionStateChanged(state) => {
-                                if let Ok(guard) = client_arc2.lock() {
-                                    if let Some((cb, user)) = guard.connection_cb.as_ref() {
-                                        let lk_state = match state {
-                                            livekit::ConnectionState::Disconnected => LkConnectionState::Disconnected,
-                                            livekit::ConnectionState::Connected => LkConnectionState::Connected,
-                                            livekit::ConnectionState::Reconnecting => LkConnectionState::Reconnecting,
-                                        };
-                                        cb(user.0, lk_state, 0, ptr::null());
-                                    }
-                                }
-                            }
-                            RoomEvent::TrackSubscribed { track, publication, participant } => {
-                                if let RemoteTrack::Audio(audio) = track {
-                                    lk_log_arc!(client_arc2, LkLogLevel::Info, "TrackSubscribed audio: name='{}', sid='{}', participant='{}'", publication.name(), publication.sid(), participant.identity());
-                                    let rtc = audio.rtc_track();
-                                    let client_arc3 = client_arc2.clone();
-                                    let track_name = publication.name().to_string();
-                                    let participant_name = participant.identity().to_string();
-                                    let (sample_rate, channels) = if let Ok(guard) = client_arc2.lock() { (guard.audio_output_format.sample_rate as u32, guard.audio_output_format.channels as u32) } else { (48_000u32, 1u32) };
-                                    tokio::spawn(async move {
-                                        let mut stream = NativeAudioStream::new(rtc, sample_rate as i32, channels as i32);
-                                        let mut logged_first = false;
-                                        while let Some(frame) = stream.next().await {
-                                            let buf: Vec<i16> = frame.data.as_ref().to_vec();
-                                            if let Ok(guard) = client_arc3.lock() {
-                                                // Try extended callback first, fall back to standard callback
-                                                if let Some((cb, user)) = guard.audio_cb_ex.as_ref() {
-                                                    let frames_per_channel = frame.samples_per_channel as usize;
-                                                    let ch = frame.num_channels as c_int;
-                                                    let sr = frame.sample_rate as c_int;
-                                                    let track_name_cstr = CString::new(track_name.as_str()).unwrap_or_default();
-                                                    let participant_name_cstr = CString::new(participant_name.as_str()).unwrap_or_default();
-                                                    cb(user.0, buf.as_ptr(), frames_per_channel, ch, sr, participant_name_cstr.as_ptr(), track_name_cstr.as_ptr());
-                                                } else if let Some((cb, user)) = guard.audio_cb.as_ref() {
-                                                    let frames_per_channel = frame.samples_per_channel as usize;
-                                                    let ch = frame.num_channels as c_int;
-                                                    let sr = frame.sample_rate as c_int;
-                                                    cb(user.0, buf.as_ptr(), frames_per_channel, ch, sr);
-                                                }
-                                            }
-                                            if !logged_first {
-                                                lk_log_arc!(client_arc3, LkLogLevel::Debug, "First remote audio frame: sr={}Hz, ch={}, fpc={}", frame.sample_rate, frame.num_channels, frame.samples_per_channel);
-                                                logged_first = true;
-                                            }
-                                        }
-                                    });
-                                }
-                            }
-                            other => { lk_log_arc!(client_arc2, LkLogLevel::Trace, "Event: {:?}", other); }
-                        }
-                    }
-                });
+                ctx.emit_connection(LkConnectionState::Connected, 0, None);
+                spawn_event_loop(&rt_loop, ctx, events, initial);
             }
             Err(e) => {
-                if let Ok(guard) = client_arc.lock() {
-                    if let Some((cb, user)) = guard.connection_cb.as_ref() {
-                        let msg = CString::new(format!("{}", e)).unwrap_or_default();
-                        cb(user.0, LkConnectionState::Failed, 1, msg.as_ptr());
-                    }
-                }
+                lk_log_arc!(ctx.client, LkLogLevel::Error, "Async connect failed: {}", e);
+                ctx.emit_connection(LkConnectionState::Failed, 1, Some(&e.to_string()));
             }
         }
     });
 
     ok()
 }
+
 #[no_mangle]
 pub extern "C" fn lk_disconnect(client: *mut LkClientHandle) -> LkResult {
     if client.is_null() {
         return err(1, "client null");
     }
+    if tokio::runtime::Handle::try_current().is_ok() {
+        return err(403, "lk_disconnect cannot be called from an FFI callback; call it from your own thread");
+    }
     let c = unsafe { &*(client as *const Client) };
-    let mut g = c.0.lock().unwrap();
 
-    if let Some(room) = g.room.take() {
+    // Retire this session's callbacks before taking the client lock: a callback in flight
+    // may itself be waiting on that lock (e.g. a send from a participant callback).
+    let gate = c.0.lock().unwrap().gate.clone();
+    gate.retire();
+
+    let mut g = c.0.lock().unwrap();
+    let had_room = if let Some(room) = g.room.take() {
         let rt = g.rt.clone();
         let _ = rt.block_on(async move {
             let _ = room.close().await; // graceful shutdown
         });
-    }
+        true
+    } else {
+        false
+    };
     lk_log!(g, LkLogLevel::Info, "Disconnected");
     g.audio_tracks.clear();
     g.default_audio_track_id = None;
+    let conn_cb = if had_room { cb_copy(&g.connection_cb) } else { None };
+    drop(g);
+
+    // The room's own Disconnected event belongs to the retired generation, so report the
+    // disconnect here, on the caller's thread, before returning.
+    if let Some((cb, user)) = conn_cb {
+        let msg = CString::new("ClientInitiated").unwrap_or_default();
+        cb(user, LkConnectionState::Disconnected, 0, msg.as_ptr());
+    }
     ok()
 }
 
@@ -1268,7 +1451,7 @@ pub extern "C" fn lk_send_data_ex(
     bytes: *const u8,
     len: usize,
     reliability: LkReliability,
-    _ordered: c_int,
+    _ordered: c_int, // no effect: reliable data is always ordered, unreliable never is
     label: *const c_char,
 ) -> LkResult {
     if client.is_null() {
@@ -1277,113 +1460,144 @@ pub extern "C" fn lk_send_data_ex(
     if bytes.is_null() {
         return err(4, "bytes null");
     }
-    
-    let c = unsafe { &*(client as *const Client) };
-    let g = c.0.lock().unwrap();
-    let room = match g.room.as_ref() {
-        Some(r) => r,
-        None => return err(6, "not connected"),
-    };
+    // Callbacks run on runtime threads, where block_on would panic (and abort the host).
+    if tokio::runtime::Handle::try_current().is_ok() {
+        return err(206, "lk_send_data cannot be called from an FFI callback; queue the send to your own thread");
+    }
 
-    // Enforce size limits (lossy traffic auto-falls back to reliable if payload exceeds MTU)
+    // Size limits (lossy traffic auto-falls back to reliable if payload exceeds MTU)
     const LOSSY_MAX: usize = 1300;
     const RELIABLE_MAX: usize = 15 * 1024;
-    let mut effective_rel = reliability;
-    if matches!(reliability, LkReliability::Lossy) && len > LOSSY_MAX {
-        effective_rel = LkReliability::Reliable;
-        lk_log!(g, LkLogLevel::Warn,
-            "Payload size ({} bytes) exceeds lossy limit ({} bytes); switching to reliable channel",
-            len, LOSSY_MAX);
-    }
-    match effective_rel {
-        LkReliability::Lossy => {
-            if len > LOSSY_MAX {
-                return err(201, &format!("lossy data size {} exceeds limit {}", len, LOSSY_MAX));
-            }
+
+    struct LogCtx { log_level: LkLogLevel }
+
+    // Gather what the send needs, then release the client lock so a slow send never
+    // holds up other FFI calls (#15).
+    let c = unsafe { &*(client as *const Client) };
+    let (participant, topic, effective_rel, unreliable, rt, stats, timeout_ms, lg) = {
+        let g = c.0.lock().unwrap();
+        let room = match g.room.as_ref() {
+            Some(r) => r,
+            None => return err(6, "not connected"),
+        };
+        // While reconnecting the SDK would park the send until the session is back.
+        // Fail fast instead and let the caller drop or queue the data.
+        let state = room.connection_state();
+        if state != livekit::ConnectionState::Connected {
+            match reliability {
+                LkReliability::Reliable => g.data_stats.reliable_dropped.fetch_add(1, Ordering::Relaxed),
+                LkReliability::Lossy => g.data_stats.lossy_dropped.fetch_add(1, Ordering::Relaxed),
+            };
+            lk_log!(g, LkLogLevel::Debug, "Send refused: connection state {:?}", state);
+            return err(204, &format!("not sent: connection is {:?}", state));
         }
-        LkReliability::Reliable => {
-            if len > RELIABLE_MAX {
-                return err(202, &format!("reliable data size {} exceeds limit {}", len, RELIABLE_MAX));
-            }
+
+        let mut effective_rel = reliability;
+        if matches!(reliability, LkReliability::Lossy) && len > LOSSY_MAX {
+            effective_rel = LkReliability::Reliable;
+            lk_log!(g, LkLogLevel::Warn,
+                "Payload size ({} bytes) exceeds lossy limit ({} bytes); switching to reliable channel",
+                len, LOSSY_MAX);
         }
-    }
+        if matches!(effective_rel, LkReliability::Reliable) && len > RELIABLE_MAX {
+            return err(202, &format!("reliable data size {} exceeds limit {}", len, RELIABLE_MAX));
+        }
+
+        // Determine topic from label or defaults
+        let topic = if !label.is_null() {
+            unsafe { cstr(label) }.unwrap_or("custom").to_string()
+        } else {
+            match effective_rel {
+                LkReliability::Reliable => g.data_labels.reliable.clone(),
+                LkReliability::Lossy => g.data_labels.lossy.clone(),
+            }
+        };
+        let unreliable = g.lossy_unreliable && matches!(effective_rel, LkReliability::Lossy);
+        (
+            room.local_participant(),
+            topic,
+            effective_rel,
+            unreliable,
+            g.rt.clone(),
+            g.data_stats.clone(),
+            g.send_timeout_ms,
+            LogCtx { log_level: g.log_level },
+        )
+    };
 
     let payload = unsafe { std::slice::from_raw_parts(bytes, len) }.to_vec();
-    
-    // Determine topic from label or defaults
-    let topic = if !label.is_null() {
-        unsafe { cstr(label) }.unwrap_or("custom").to_string()
-    } else {
-        match effective_rel {
-            LkReliability::Reliable => g.data_labels.reliable.clone(),
-            LkReliability::Lossy => g.data_labels.lossy.clone(),
+
+    // One byte stream on the reliable, ordered data channel. total_length lets the
+    // receiver reject a stream cut short (e.g. by the send timeout) rather than deliver
+    // a truncated payload.
+    async fn send_stream(participant: &LocalParticipant, topic: &str, payload: &[u8]) -> Result<()> {
+        let options = StreamByteOptions {
+            topic: topic.to_string(),
+            total_length: Some(payload.len() as u64),
+            ..Default::default()
+        };
+        let writer: ByteStreamWriter = participant.stream_bytes(options).await?;
+        writer.write(payload).await?;
+        writer.close().await?;
+        Ok(())
+    }
+
+    let send = async {
+        if unreliable {
+            // Unreliable, unordered, no retransmits (opt-in, see lk_set_lossy_unreliable).
+            let packet = DataPacket {
+                payload: payload.clone(),
+                topic: Some(topic.clone()),
+                reliable: false,
+                ..Default::default()
+            };
+            participant.publish_data(packet).await.map_err(anyhow::Error::from)
+        } else {
+            match send_stream(&participant, &topic, &payload).await {
+                Ok(()) => Ok(()),
+                Err(e1) => {
+                    // Brief backoff then one retry; common when engine is still settling right after join
+                    lk_log!(lg, LkLogLevel::Warn, "send_data first attempt failed, retrying: {}", e1);
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    send_stream(&participant, &topic, &payload).await
+                }
+            }
         }
     };
 
-    let rt = g.rt.clone();
-    let stats = g.data_stats.clone();
-    let effective_rel_copy = effective_rel;
-    let current_log_level = g.log_level;
-    
     let res = rt.block_on(async {
-        // Helper to perform one send attempt
-        async fn send_once(
-            room: &Room,
-            topic: &str,
-            payload: &[u8],
-        ) -> Result<(), anyhow::Error> {
-            let options = StreamByteOptions { topic: topic.to_string(), ..Default::default() };
-            let writer: ByteStreamWriter = room
-                .local_participant()
-                .stream_bytes(options)
-                .await?;
-            writer.write(payload).await?;
-            writer.close().await?;
-            Ok(())
-        }
-
-        // First attempt
-        match send_once(room, &topic, &payload).await {
-            Ok(_) => Ok(()),
-            Err(e1) => {
-                // Brief backoff then one retry; common when engine is still settling right after join
-                if (LkLogLevel::Warn as i32) <= (current_log_level as i32) {
-                    println!("[livekit_ffi] send_data first attempt failed, retrying: {}", e1);
-                }
-                tokio::time::sleep(Duration::from_millis(100)).await;
-                send_once(room, &topic, &payload).await
-            }
+        if timeout_ms == 0 {
+            Ok::<_, tokio::time::error::Elapsed>(send.await)
+        } else {
+            tokio::time::timeout(Duration::from_millis(timeout_ms), send).await
         }
     });
 
+    let count_drop = || match effective_rel {
+        LkReliability::Reliable => stats.reliable_dropped.fetch_add(1, Ordering::Relaxed),
+        LkReliability::Lossy => stats.lossy_dropped.fetch_add(1, Ordering::Relaxed),
+    };
     match res {
-        Ok(_) => {
-            // Update statistics
-            match effective_rel_copy {
-                LkReliability::Reliable => {
-                    stats.reliable_sent_bytes.fetch_add(len as i64, Ordering::Relaxed);
-                }
-                LkReliability::Lossy => {
-                    stats.lossy_sent_bytes.fetch_add(len as i64, Ordering::Relaxed);
-                }
-            }
-            lk_log!(g, LkLogLevel::Debug, "Sent data: {} bytes, topic='{}'", len, topic);
+        Ok(Ok(())) => {
+            match effective_rel {
+                LkReliability::Reliable => stats.reliable_sent_bytes.fetch_add(len as i64, Ordering::Relaxed),
+                LkReliability::Lossy => stats.lossy_sent_bytes.fetch_add(len as i64, Ordering::Relaxed),
+            };
+            lk_log!(lg, LkLogLevel::Debug, "Sent data: {} bytes, topic='{}', {}", len, topic, if unreliable { "unreliable packet" } else { "byte stream" });
             ok()
-        },
-        Err(e) => {
-            // Update drop statistics
-            match effective_rel_copy {
-                LkReliability::Reliable => {
-                    stats.reliable_dropped.fetch_add(1, Ordering::Relaxed);
-                }
-                LkReliability::Lossy => {
-                    stats.lossy_dropped.fetch_add(1, Ordering::Relaxed);
-                }
-            }
-            let msg = format!("byte_stream write failed: {}", e);
-            lk_log!(g, LkLogLevel::Error, "{}", msg);
+        }
+        Ok(Err(e)) => {
+            count_drop();
+            let msg = format!("send failed: {}", e);
+            lk_log!(lg, LkLogLevel::Error, "{}", msg);
             err(203, &msg)
-        },
+        }
+        Err(_) => {
+            count_drop();
+            let msg = format!("send did not complete within {} ms (reconnecting or congested); it may or may not have been delivered", timeout_ms);
+            lk_log!(lg, LkLogLevel::Warn, "{}", msg);
+            err(205, &msg)
+        }
     }
 }
 

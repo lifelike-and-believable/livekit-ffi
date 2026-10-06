@@ -25,6 +25,7 @@ pub unsafe extern "C" fn lk_free_str(p: *mut c_char) {
 #[repr(C)] pub enum LkReliability { Reliable = 0, Lossy = 1 }
 #[repr(C)] pub enum LkRole { Auto = 0, Publisher = 1, Subscriber = 2, Both = 3 }
 #[repr(C)] pub enum LkConnectionState { Connecting = 0, Connected = 1, Reconnecting = 2, Disconnected = 3, Failed = 4 }
+#[repr(C)] pub enum LkParticipantEvent { Joined = 0, Left = 1 }
 #[repr(C)] pub enum LkLogLevel { Error = 0, Warn = 1, Info = 2, Debug = 3, Trace = 4 }
 #[repr(C)] pub struct LkClientHandle { _private: [u8;0] }
 
@@ -233,6 +234,22 @@ pub extern "C" fn lk_audio_track_publish_pcm_i16(
     _client:*mut LkClientHandle,
     _reliable_label: *const c_char,
     _lossy_label: *const c_char
+) -> LkResult { ok() }
+
+#[no_mangle] pub extern "C" fn lk_set_participant_callback(
+    _client:*mut LkClientHandle,
+    _cb: Option<extern "C" fn(user:*mut c_void, event:LkParticipantEvent, identity:*const c_char, name:*const c_char)>,
+    _user: *mut c_void
+) -> LkResult { ok() }
+
+#[no_mangle] pub extern "C" fn lk_set_lossy_unreliable(
+    _client:*mut LkClientHandle,
+    _enable: c_int
+) -> LkResult { ok() }
+
+#[no_mangle] pub extern "C" fn lk_set_send_timeout_ms(
+    _client:*mut LkClientHandle,
+    _timeout_ms: c_int
 ) -> LkResult { ok() }
 
 #[no_mangle] pub extern "C" fn lk_set_reconnect_backoff(

@@ -356,7 +356,7 @@ if (result.code != 0) {
 
 **Error Code Ranges:**
 - `1xx` - Connection/Token errors
-- `2xx` - Data send errors (201: lossy too large, 202: reliable too large)
+- `2xx` - Data send errors (202: reliable too large, 203: send failed, 204: reconnecting, 205: send timeout, 206: called from a callback)
 - `3xx` - Audio publish errors
 - `4xx` - Lifecycle errors
 - `5xx` - Internal errors (501: not supported)
@@ -639,7 +639,7 @@ LkResult result = lk_send_data_ex(
 ```
 
 **Size Limits:**
-- Lossy: Max 1300 bytes (error 201 if exceeded)
+- Lossy: Max 1300 bytes (larger payloads are sent as reliable data instead)
 - Reliable: Max ~15 KiB (error 202 if exceeded)
 
 **Best practices:**
@@ -1135,7 +1135,7 @@ void send_position_update(const Position& pos) {
 void send_position_update(const Position& pos) {
     uint8_t buffer[5000];  // Too large!
     size_t size = serialize_position(buffer, &pos);
-    lk_send_data(client, buffer, size, LkLossy);  // Will fail with error 201
+    lk_send_data(client, buffer, size, LkLossy);  // Silently sent as reliable data
 }
 ```
 
