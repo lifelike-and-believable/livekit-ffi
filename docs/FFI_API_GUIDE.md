@@ -111,11 +111,13 @@ lk_send_data_ex(client, pose_data, sizeof(pose_data),
 transport, and never hold up other FFI calls on the client:
 
 - While the connection is reconnecting they return **204** at once, without sending.
+  Drop or queue the data and resend after `LkConnConnected`.
 - Otherwise the send is bounded by `lk_set_send_timeout_ms` (default 1000 ms;
-  `0` = unbounded, the pre-0.4 behaviour) and returns **205** on timeout.
+  `0` = unbounded, the pre-0.4 behaviour) and returns **205** on timeout. The first
+  sends after connecting also wait for the publisher connection to come up.
 
-In both cases the data was **not** delivered. Drop it or queue it, and resend
-after `LkConnConnected`.
+After **205** (or **203**, send failed) the outcome is unknown: the data may still
+have arrived. Never resend the same delta; send full state instead.
 
 ```c
 lk_set_send_timeout_ms(client, 250);   // tighter bound for a game thread
@@ -149,11 +151,12 @@ every receiver is on 0.4 or newer.
 |---|---|---|
 | Transport | One byte stream per send, reliable ordered channel | One data packet, lossy channel |
 | Order | Send order, per sender | None |
-| Loss | None while the session stays up | Any packet may be lost |
-| Integrity | Whole payloads only: incomplete streams are dropped, never delivered truncated | Whole packets |
+| Loss | None while the session stays up, except: a stream that arrives incomplete or does not finish within 2 s is dropped at the receiver, and neither side is told | Any packet may be lost |
+| Integrity | Whole payloads only, never delivered truncated | Whole packets |
 
 A send that returns `0` has been handed to the transport. That is not an
-acknowledgement that any receiver has it.
+acknowledgement that any receiver has it. `204` means not sent; `203` and `205`
+mean the outcome is unknown.
 
 **Reconnects.** The connection callback reports `LkConnReconnecting`, then
 `LkConnConnected` when the session is back (or `LkConnDisconnected`).
@@ -327,7 +330,7 @@ if (result.code != 0) {
     //   202: Reliable data too large (> 15 KiB)
     //   203: Send operation failed
     //   204: Not sent: connection is reconnecting (returned immediately)
-    //   205: Not sent: send timeout elapsed (lk_set_send_timeout_ms)
+    //   205: Send timeout elapsed (lk_set_send_timeout_ms); may have been delivered
     //   206: Called from an FFI callback thread
     // 3xx: Audio publish errors
     // 4xx: Lifecycle errors

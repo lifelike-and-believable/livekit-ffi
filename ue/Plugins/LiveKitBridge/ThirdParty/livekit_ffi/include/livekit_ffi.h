@@ -19,9 +19,10 @@ extern "C" {
  * - 1xx: Connection/Token errors
  * - 2xx: Data send errors
  *     202 reliable payload larger than 15 KiB
- *     203 send failed
+ *     203 send failed; outcome unknown (may have been delivered)
  *     204 not sent: the connection is reconnecting (returned at once, see lk_send_data_ex)
- *     205 not sent: the send did not finish within the send timeout (lk_set_send_timeout_ms)
+ *     205 send did not finish within the send timeout (lk_set_send_timeout_ms);
+ *         outcome unknown (may have been delivered)
  *     206 called from an FFI callback thread (queue the send to your own thread)
  * - 3xx: Audio publish errors
  * - 4xx: Lifecycle errors
@@ -382,7 +383,9 @@ LkResult lk_send_data(
  * send timeout (lk_set_send_timeout_ms, default 1000 ms, then code 205). It never
  * holds up other FFI calls on the client. While the connection is reconnecting it
  * returns 204 at once without sending; drop or queue the data and resend after
- * LkConnConnected. Must not be called from inside an FFI callback (returns 206).
+ * LkConnConnected. After 203 or 205 the data may or may not have arrived: never
+ * resend the same delta, send full state instead. Must not be called from inside an
+ * FFI callback (returns 206).
  */
 LkResult lk_send_data_ex(
   LkClientHandle*,
@@ -411,8 +414,10 @@ LkResult lk_set_lossy_unreliable(LkClientHandle*, int32_t enable);
 
 /**
  * Bound how long lk_send_data / lk_send_data_ex may block, in milliseconds.
- * Default 1000. 0 means no bound (the pre-0.4 behaviour). On timeout the send returns
- * 205 and the data must be treated as not delivered.
+ * Default 1000. 0 means no bound (the pre-0.4 behaviour, under which a reconnect that
+ * starts mid-send blocks the caller until it ends). On timeout the send returns 205;
+ * the data may or may not have been delivered.
+ * The first sends after connecting also wait for the publisher connection to come up.
  */
 LkResult lk_set_send_timeout_ms(LkClientHandle*, int32_t timeout_ms);
 
@@ -423,11 +428,13 @@ LkResult lk_set_send_timeout_ms(LkClientHandle*, int32_t timeout_ms);
 // Reliable data (LkReliable, and LkLossy unless lk_set_lossy_unreliable is on):
 // - Each send is one byte stream on the publisher's reliable, ordered data channel.
 // - While the session stays up, data from one sender reaches each receiver once, in
-//   send order, with nothing lost. Receivers read streams in arrival order and
-//   deliver each payload whole; a stream that arrives incomplete (or does not finish
-//   within 2 s) is dropped, never delivered truncated.
-// - A send that returns 204 or 205 was not delivered. 0 means the data was handed to
-//   the transport, not that a receiver has it.
+//   send order. Receivers read streams in arrival order and deliver each payload
+//   whole. One exception: a stream that arrives incomplete, or does not finish within
+//   2 s of opening, is dropped at the receiver, and neither side is told (the sender
+//   already got 0). Payloads are never delivered truncated.
+// - 0 means the data was handed to the transport, not that a receiver has it.
+//   204 means it was not sent. 203 and 205 mean the outcome is unknown: it may have
+//   arrived, so never resend the same delta; send full state instead.
 //
 // Unreliable data (LkLossy with lk_set_lossy_unreliable(client, 1)):
 // - Single packets on the lossy channel: unordered, no retransmission. Any packet

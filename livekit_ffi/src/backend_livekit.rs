@@ -434,7 +434,13 @@ pub extern "C" fn lk_client_destroy(client: *mut LkClientHandle) {
         Ok(g) => g.gate.clone(),
         Err(e) => e.into_inner().gate.clone(),
     };
-    gate.retire();
+    if tokio::runtime::Handle::try_current().is_ok() {
+        // Called from inside a callback, which holds the dispatch lock on this thread:
+        // waiting for it would self-deadlock, so only retire the generation.
+        gate.generation.fetch_add(1, Ordering::SeqCst);
+    } else {
+        gate.retire();
+    }
     let (room, rt) = match boxed.0.lock() {
         Ok(mut g) => {
             g.audio_tracks.clear();
@@ -1588,7 +1594,7 @@ pub extern "C" fn lk_send_data_ex(
         }
         Err(_) => {
             count_drop();
-            let msg = format!("send did not complete within {} ms (reconnecting or congested); not delivered", timeout_ms);
+            let msg = format!("send did not complete within {} ms (reconnecting or congested); it may or may not have been delivered", timeout_ms);
             lk_log!(lg, LkLogLevel::Warn, "{}", msg);
             err(205, &msg)
         }
